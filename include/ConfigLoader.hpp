@@ -21,13 +21,15 @@ private:
     constexpr static float DEFAULT_SMOOTHNESS = 1.0F; /**< Default interpolation smoothness (fSmoothness) */
     constexpr static float DEFAULT_MAX_RISE = 3.0F; /**< Default upward overshoot allowance (fMaxRise) */
     constexpr static float MAX_RISE_CAP = 100000.0F; /**< Past the tallest landscape relief, so effectively no limit */
-    constexpr static float DEFAULT_SMOOTHED_GRIDS = 2.0F; /**< Default smoothed-grid radius (iSmoothedGrids) */
+    constexpr static float DEFAULT_SMOOTHED_QUADS = 3.0F; /**< Default smoothed-quad radius (iSmoothedQuads):
+                                                             a 5x5 quad square keeps every stitched border line
+                                                             at least two quads (4096 units) from the player */
 
 public:
-    constexpr static int MIN_SMOOTHED_GRIDS = 2; /**< Smallest non-zero smoothed-grid radius: the player's cell
-                                                    plus its full neighbor ring (3x3). A lone smoothed cell
-                                                    would put the stitched (unsmoothed) border lines right at
-                                                    the player's feet. */
+    constexpr static int MIN_SMOOTHED_QUADS = 2; /**< Smallest non-zero smoothed-quad radius: the player's quad
+                                                    plus its full neighbor ring (3x3 quads). A lone smoothed
+                                                    quad would put the stitched (unsmoothed) border lines right
+                                                    at the player's feet. */
 
 private:
 
@@ -43,7 +45,9 @@ private:
         int subdivisions {}; /**< How many times each 128-unit land quad is split in half per axis (0-3) */
         float smoothness {}; /**< 0 = flat bilinear interpolation, 1 = full Catmull-Rom smoothing */
         float maxRise {}; /**< World units the curve may rise above the original verts around it */
-        int smoothedGrids {}; /**< Diameter of the smoothed grid square around the player (0 = all loaded grids) */
+        int smoothedQuads {}; /**< Radius, in landscape quads (2048 units, a quarter cell), of the smoothed
+                                 square, counting the player's own quad (2 = 3x3 quads); 0 = no distance
+                                 limit, every loaded quad is smoothed */
     };
 
     static inline ConfigMap s_config; /**< Holds the current configuration values for the plugin */
@@ -95,19 +99,23 @@ public:
     static auto getMaxRise() -> float;
 
     /**
-     * @brief Get the radius, in grids, of the smoothed square around the player
+     * @brief Get the radius, in landscape quads, of the smoothed square around the player
      *
-     * Counts the player's own grid: 2 means the cell the player stands in plus its full ring
-     * of neighbors (a 3x3 square, diagonals included), 3 a 5x5 square, and so on - a value of
-     * n covers a (2n-1) by (2n-1) square. Cells outside the square keep the vanilla land
-     * mesh, and the square moves with the player (see TerrainFalloff). The runtime
-     * additionally caps the square at the game's loaded-grid size, since a cell that is not
-     * loaded has no mesh to smooth.
+     * A landscape quad is a quarter of a cell, 2048 world units per side - the unit the land
+     * meshes are actually built in, so the region boundary can sit at half-cell resolution
+     * and the distance from the player is consistent no matter where in a cell they stand.
+     * Counts the player's own quad: 2 means the quad the player stands in plus its full ring
+     * of neighbors (a 3x3 quad square, diagonals included), 3 a 5x5 square, and so on - a
+     * value of n covers a (2n-1) by (2n-1) quad square. Quads outside the square keep the
+     * vanilla land mesh, and the square moves with the player (see TerrainFalloff). The
+     * runtime additionally caps the square at the game's loaded-grid size, since a quad whose
+     * cell is not loaded has no mesh to smooth.
      *
-     * @return int The radius (>= 2, counting the player's grid), or 0 to smooth every loaded
-     *         grid at build time with no distance falloff
+     * @return int The radius (>= 2, counting the player's quad), or 0 for no distance limit -
+     *         every loaded quad gets the smoothed mesh, still built in the background (nothing
+     *         is ever built during the engine's own cell loading)
      */
-    static auto getSmoothedGrids() -> int;
+    static auto getSmoothedQuads() -> int;
 
 private:
     /**

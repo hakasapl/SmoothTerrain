@@ -9,10 +9,12 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace SmoothTerrain {
 
@@ -20,13 +22,18 @@ namespace SmoothTerrain {
  * @brief Keeps the smoothed terrain in a square of grids around the player and swaps meshes
  * without stutter as the player moves
  *
- * With iSmoothedGrids > 0 the build hook no longer subdivides at build time; every land quad
- * starts with its vanilla mesh and is registered here instead. This class then maintains the
- * invariant that exactly the cells within the configured square around the player's cell (a
- * Chebyshev radius counting the player's own grid, so 2 covers the 3x3 neighbor square)
- * render the smoothed mesh, and everything further out renders vanilla. The square is capped
- * at the game's actual loaded grid, read from the grid array itself at runtime, so any value
- * whose square would reach past the loaded grid simply smooths everything that is loaded.
+ * The build hook never subdivides at build time; every land quad starts with its vanilla
+ * mesh and is registered here instead. This class then maintains the invariant that exactly
+ * the landscape quads within the configured square around the quad under the player (a
+ * Chebyshev radius in quad units - a quad is a quarter cell, 2048 world units - counting the
+ * player's own quad, so 2 covers the 3x3 quad square) render the smoothed mesh, and
+ * everything further out renders vanilla. Quad units mean the boundary moves at half-cell
+ * resolution and keeps a consistent distance from the player wherever they stand in a cell;
+ * two quads of one cell can differ, with their shared interior line stitched exactly like a
+ * cell border. The square is capped at the game's actual loaded grid, read from the grid
+ * array itself at runtime; iSmoothedQuads = 0 lifts the distance limit, which is simply the
+ * square covering the whole loaded grid - the builds still run through the same background
+ * machinery, never inside a cell load.
  *
  * The stutter-free part rests on three legs:
  *  - Reverting to vanilla is free. The engine's own vanilla buffers are never released while
@@ -40,17 +47,18 @@ namespace SmoothTerrain {
  *    scene-graph-mutating SKSE plugin uses, so a draw in flight can never observe a half
  *    swapped shape.
  *
- * Region updates are driven by three triggers that together cover every way the region can
- * change: the player's own cell-change broadcast (BGSActorCellEvent, the authoritative
- * "player crossed a cell border" signal - cell attach/detach traffic alone is not enough,
- * since re-entering buffered cells reattaches their existing land without rebuilding it and
- * a sparse wilderness cell may dispatch no reference events at all), the cell attach/detach
- * stream (grid changes while the player stands still), and every quad registration (async
- * land builds finishing after the events went quiet). Each trigger only sets a flag; one
- * queued main-thread pass (recompute) then walks the loaded grid, decides the target state
- * per cell, reverts instantly where smoothing must go away and queues worker builds where it
- * is missing - one pass handles entering and leaving cells together. A generation counter
- * per quad discards results that a faster moving player already made stale.
+ * Region updates are driven by four triggers that together cover every way the region can
+ * change: the worker's position poll (quad crossings inside a cell have no engine event, see
+ * pollPlayerQuad), the player's cell-change broadcast (BGSActorCellEvent - cell attach/detach
+ * traffic alone is not enough, since re-entering buffered cells reattaches their existing
+ * land without rebuilding it and a sparse wilderness cell may dispatch no reference events at
+ * all), the cell attach/detach stream (grid changes while the player stands still), and
+ * every quad registration (async land builds finishing after the events went quiet). Each
+ * trigger only sets a flag; one queued main-thread pass (recompute) then walks the loaded
+ * grid, decides the target state per quad, reverts instantly where smoothing must go away
+ * and queues worker builds where it is missing - one pass handles entering and leaving quads
+ * together. A generation counter per quad discards results that a faster moving player
+ * already made stale.
  *
  * Tracked quads are resolved through the scene graph (the children of the per-quadrant
  * multibound nodes in LoadedLandData::mesh), not through LoadedLandData::geom: the engine's
@@ -71,8 +79,16 @@ namespace SmoothTerrain {
  * While a region shift is still in flight the two sides of an edge can briefly disagree
  * (quads apply as their builds finish, not as one atomic batch). The mismatch is bounded by
  * the spline's deviation from the straight edge, sits a full cell or more from the player,
- * and settles within the few frames the worker needs to drain the batch - a hairline that
- * buys keeping every swap a plain field write, which is what makes crossings stutter-free.
+ * and settles within a moment - a hairline that buys keeping every swap a plain field
+ * write, which is what makes crossings stutter-free.
+ *
+ * Cell loads are treated as sacred: while the engine streams cells in, every core and the
+ * driver are already saturated, and VR has no frame headroom to absorb extra work. So
+ * registration copies nothing (snapshots are captured lazily when a build is first wanted),
+ * the worker runs at below-normal priority, holds its batch until land builds have been
+ * quiet for a beat and then paces one build every few milliseconds, and shapes retired by
+ * the prune pass drop their last reference on the worker so their GPU buffers are never
+ * released in a main-thread burst.
  */
 class TerrainFalloff {
 public:
@@ -85,8 +101,8 @@ public:
     static void install();
 
     /**
-     * @brief Whether quads should be registered for distance-based smoothing instead of being
-     * subdivided at build time
+     * @brief Whether the manager is running (supported runtime, iSubdivisions > 0) and the
+     * build hook should register quads
      */
     [[nodiscard]] static auto isEnabled() -> bool;
 
@@ -100,18 +116,17 @@ public:
     /**
      * @brief Starts tracking a freshly built vanilla land quad
      *
-     * Called by the build hook on whichever thread the engine builds land on. Validates and
-     * snapshots the quad (see TerrainSubdivision::snapshotQuad; anything that is not the
-     * vanilla layout is left alone forever, same as the eager path's fallback), stores the
-     * vanilla buffer set for later instant reverts, takes a strong reference to the shape and
-     * queues a region pass so a quad born inside the smoothed square gets its mesh promptly.
+     * Called by the build hook on whichever thread the engine builds land on - during cell
+     * attach, the one moment the frame has no headroom - so it does as close to nothing as
+     * possible: validate the layout (see TerrainSubdivision::validateQuadLayout; anything
+     * that is not the vanilla layout is left alone forever), record the vanilla buffer set
+     * for later instant reverts, take a strong reference, and queue a region pass. No copies:
+     * the build snapshot is captured lazily by the region pass when a build is first wanted.
      *
      * @param shape The vanilla-built quad shape
-     * @param data Loaded land data of the cell (the height tables)
      * @param quad Quadrant index 0-3 (0 = SW, 1 = SE, 2 = NW, 3 = NE)
      */
     static void registerQuad(RE::BSTriShape* shape,
-                             const RE::TESObjectLAND::LoadedLandData& data,
                              std::uint32_t quad);
 
     TerrainFalloff() = delete;
@@ -125,6 +140,18 @@ private:
                                                                   only reference may briefly be ours (the builder
                                                                   holds a raw pointer on its stack), and pruning
                                                                   then would destroy a shape about to be attached */
+    constexpr static std::chrono::milliseconds K_BUILD_QUIET_PERIOD {250}; /**< Builds start only after land
+                                                                  builds have been quiet this long: registrations
+                                                                  only happen while the engine loads cells, which
+                                                                  is exactly when no core has cycles to spare
+                                                                  (see workerLoop) */
+    constexpr static std::chrono::milliseconds K_BUILD_SPACING {8}; /**< Pause between consecutive builds so a
+                                                                  region shift's batch is a trickle, not a burst
+                                                                  of CPU work and driver uploads (see workerLoop) */
+    constexpr static std::chrono::milliseconds K_PLAYER_POLL_INTERVAL {200}; /**< How often the worker checks
+                                                                  whether the player crossed a quad line; the
+                                                                  engine only announces cell changes, and quads
+                                                                  are half that size (see pollPlayerQuad) */
 
     /**
      * @brief Everything tracked about one registered land quad
@@ -133,7 +160,11 @@ private:
         RE::NiPointer<RE::BSTriShape> shape; /**< Strong ref: keeps the shape (and its address, which is our
                                                   registry key) alive while tracked */
         std::shared_ptr<const TerrainSubdivision::QuadSnapshot> snapshot; /**< Immutable build input, shared
-                                                                              with worker jobs */
+                                                                              with worker jobs. Captured lazily
+                                                                              by the region pass when a build is
+                                                                              first wanted - registration must
+                                                                              stay copy-free (see registerQuad) */
+        std::uint64_t vertexDesc {}; /**< The validated vertex descriptor, kept for the lazy capture */
         std::uint32_t quad {}; /**< Quadrant index 0-3 */
         TerrainSubdivision::MeshBuffers vanilla; /**< The engine's own buffers, kept alive for instant reverts */
         std::optional<TerrainSubdivision::MeshBuffers> smoothed; /**< The smoothed set currently installed */
@@ -223,15 +254,49 @@ private:
                                const std::optional<TerrainSubdivision::MeshBuffers>& mesh);
 
     /**
-     * @brief Hands a job to the worker thread, starting it on first use
+     * @brief Hands a region pass's builds to the worker thread, starting it on first use
+     *
+     * The caller orders the batch nearest-quad-first; the worker preserves that order, so
+     * after a load the terrain around the player smooths before the distance does.
      */
-    static void enqueueJob(Job&& job);
+    static void enqueueJobs(std::vector<Job>&& jobs);
+
+    /**
+     * @brief Starts the worker thread if it is not running yet; requires s_jobMutex held
+     */
+    static void ensureWorkerLocked();
+
+    /**
+     * @brief Schedules a region pass when the player has crossed into a different quad
+     *
+     * Runs on the worker thread every K_PLAYER_POLL_INTERVAL: the region's granularity is a
+     * landscape quad, but the engine only broadcasts cell changes, so quad crossings inside a
+     * cell would otherwise go unnoticed. Reading the player's position off-main is a benign
+     * race - a torn value at worst schedules one extra pass, which then recomputes everything
+     * from clean main-thread state.
+     */
+    static void pollPlayerQuad();
+
+    /**
+     * @brief Hands retired shapes to the worker thread so their last reference drops there
+     *
+     * Each destruction releases GPU buffers through the engine, and one region pass can
+     * retire dozens of dead builder generations at once - done on the main thread that is a
+     * visible spike on VR. Requires s_entryMutex held (the established s_entryMutex ->
+     * s_jobMutex order).
+     */
+    static void buryShapes(std::vector<RE::NiPointer<RE::BSTriShape>>&& shapes);
 
     /**
      * @brief The worker: builds smoothed meshes and posts them back as main-thread tasks
      *
-     * Runs detached for the lifetime of the process. Skips jobs whose generation is already
-     * stale before doing any work, so a sprinting player does not pile up dead builds.
+     * Runs detached for the lifetime of the process at below-normal priority - its work is
+     * never latency-critical (the smoothing boundary sits a full cell away), while the game's
+     * own threads are. Before starting a build it waits out K_BUILD_QUIET_PERIOD since the
+     * last land-build registration, so batches never compete with a cell load in flight, and
+     * it sleeps K_BUILD_SPACING between builds so a batch trickles instead of bursting. Skips
+     * jobs whose generation is already stale before doing any work, so a sprinting player
+     * does not pile up dead builds. Also drains the graveyard (see buryShapes).
      */
     static void workerLoop();
 
@@ -244,10 +309,18 @@ private:
     static inline CellSink s_cellSink;
     static inline PlayerCellSink s_playerCellSink;
 
-    static inline std::mutex s_jobMutex; /**< Guards s_jobs and s_workerStarted */
+    static inline std::mutex s_jobMutex; /**< Guards s_jobs, s_graveyard and s_workerStarted */
     static inline std::condition_variable s_jobSignal;
     static inline std::deque<Job> s_jobs;
+    static inline std::vector<RE::NiPointer<RE::BSTriShape>> s_graveyard; /**< Shapes awaiting off-main release */
     static inline bool s_workerStarted = false;
+    static inline std::atomic<std::chrono::steady_clock::duration::rep> s_lastLandBuild {}; /**< Timestamp of the
+                                                                  newest registration; the worker's quiet-period
+                                                                  clock (a land build means a cell load is in
+                                                                  flight) */
+    static inline std::atomic<std::int64_t> s_lastPlayerQuad {
+        std::numeric_limits<std::int64_t>::min()}; /**< The player's quad as of the last region pass or poll,
+                                                      packed (x << 32 | y); the poll's change detector */
 };
 
 } // namespace SmoothTerrain

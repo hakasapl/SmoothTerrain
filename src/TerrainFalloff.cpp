@@ -6,18 +6,23 @@
 
 #include "PCH.h"
 
+#include <Windows.h>
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
 #include <utility>
+#include <vector>
 
 using namespace SmoothTerrain;
 
@@ -29,18 +34,22 @@ void TerrainFalloff::install()
         return;
     }
 
-    if (ConfigLoader::getSmoothedGrids() <= 0) {
-        spdlog::info("Distance falloff disabled (iSmoothedGrids = 0); every loaded grid is smoothed at build time");
-        return;
-    }
-
+    // Every mode runs through this manager, including iSmoothedQuads = 0: subdividing during
+    // the engine's own cell loading (the old eager path) is a guaranteed load-time hitch, so
+    // "no distance limit" simply means the region covers the whole loaded grid while the
+    // builds still happen in the background
     s_enabled = true;
-    const int side = (2 * ConfigLoader::getSmoothedGrids()) - 1;
-    spdlog::info("Distance falloff active: a {0}x{0} grid square around the player renders the smoothed mesh "
-                 "(radius {1} counting the player's grid, capped at the game's loaded-grid size); everything "
-                 "further renders the vanilla mesh",
-                 side,
-                 ConfigLoader::getSmoothedGrids());
+    if (ConfigLoader::getSmoothedQuads() <= 0) {
+        spdlog::info("No smoothing distance limit (iSmoothedQuads = 0): every loaded landscape quad renders the "
+                     "smoothed mesh, built in the background shortly after its cell loads");
+    } else {
+        const int side = (2 * ConfigLoader::getSmoothedQuads()) - 1;
+        spdlog::info("Distance falloff active: a {0}x{0} landscape-quad square around the player renders the "
+                     "smoothed mesh (radius {1} counting the player's quad; a quad is half a grid, 2048 units); "
+                     "everything further renders the vanilla mesh",
+                     side,
+                     ConfigLoader::getSmoothedQuads());
+    }
 }
 
 auto TerrainFalloff::isEnabled() -> bool { return s_enabled; }
@@ -74,6 +83,13 @@ void TerrainFalloff::onDataLoaded()
     }
     holder->AddEventSink<RE::TESCellAttachDetachEvent>(&s_cellSink);
     spdlog::info("Terrain falloff cell sink registered");
+
+    // The worker doubles as the quad-crossing detector (see pollPlayerQuad), so it must be
+    // alive before the first build is ever wanted
+    {
+        const std::lock_guard<std::mutex> lock(s_jobMutex);
+        ensureWorkerLocked();
+    }
 }
 
 auto TerrainFalloff::CellSink::ProcessEvent(const RE::TESCellAttachDetachEvent* /*event*/,
@@ -97,22 +113,27 @@ auto TerrainFalloff::PlayerCellSink::ProcessEvent(const RE::BGSActorCellEvent* e
 }
 
 void TerrainFalloff::registerQuad(RE::BSTriShape* shape,
-                                  const RE::TESObjectLAND::LoadedLandData& data,
                                   std::uint32_t quad)
 {
-    auto snapshot = TerrainSubdivision::snapshotQuad(*shape, data, quad);
-    if (snapshot == nullptr) {
-        // Same causes as the eager path's fallback (foreign layout, no CPU vertex copy):
-        // another mod owns this quad and it stays vanilla for good
+    // A land build means a cell load is in flight; the worker holds its batch until this
+    // clock has been quiet for a beat (see workerLoop)
+    s_lastLandBuild.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+
+    const auto vertexDesc = TerrainSubdivision::validateQuadLayout(*shape);
+    if (!vertexDesc.has_value()) {
+        // Foreign layout or no CPU vertex copy: another mod owns this quad and it stays
+        // vanilla for good
         spdlog::debug("Quad {} kept its vanilla land mesh", quad);
         return;
     }
 
     // Reading the freshly built shape off-main is safe here: the builder has not attached it
-    // to anything yet, so no other thread can see it
+    // to anything yet, so no other thread can see it. Deliberately no copies (the engine
+    // calls the builder 16 times per cell attach); the snapshot is captured lazily by the
+    // region pass when a build is first wanted.
     Entry entry;
     entry.shape = RE::NiPointer<RE::BSTriShape> {shape};
-    entry.snapshot = std::move(snapshot);
+    entry.vertexDesc = *vertexDesc;
     entry.quad = quad;
     entry.vanilla = TerrainSubdivision::currentMesh(*shape);
     entry.registeredAt = std::chrono::steady_clock::now();
@@ -174,18 +195,42 @@ void TerrainFalloff::recompute()
     auto* grid = tes != nullptr ? tes->gridCells : nullptr;
 
     if (center != nullptr && grid != nullptr && grid->cells != nullptr) {
-        // The smoothed square, never wider than the loaded grid itself - the grid array's
-        // length is the live uGridsToLoad, whatever set it. iSmoothedGrids counts the
-        // player's own grid, so 2 covers the 3x3 square of the player's cell plus its full
-        // neighbor ring. Membership being pure coordinate math is what makes the stitching
-        // sound: both cells of any shared edge always agree on whether that edge is pinned.
+        // The loaded grid bounds everything: a quad whose cell is not loaded has no mesh to
+        // smooth. The grid array's length is the live uGridsToLoad, whatever set it.
         const int loadedRadius
             = grid->length > 0 ? (static_cast<int>(grid->length) - 1) / 2 : K_DEFAULT_LOADED_RADIUS;
-        const int radius = std::min(ConfigLoader::getSmoothedGrids() - 1, loadedRadius);
-        const auto inRegion = [&](int cellDeltaX, int cellDeltaY) -> bool {
-            return std::max(std::abs(cellDeltaX), std::abs(cellDeltaY)) <= radius;
+
+        // The region lives in landscape-quad coordinates (a cell is 2x2 quads), centered on
+        // the quad under the player's feet, so the boundary sits at half-cell resolution and
+        // its distance from the player does not depend on where in a cell they stand. 0 means
+        // no distance limit: every quad of a loaded cell qualifies. Membership stays pure
+        // coordinate math, so both quads of any shared border line always agree on whether
+        // that line is pinned - within one cell and across cells alike.
+        const auto playerPosition = player->GetPosition();
+        const auto playerQuadX
+            = static_cast<int>(std::floor(playerPosition.x / TerrainSubdivision::K_QUAD_WORLD_SIZE));
+        const auto playerQuadY
+            = static_cast<int>(std::floor(playerPosition.y / TerrainSubdivision::K_QUAD_WORLD_SIZE));
+        s_lastPlayerQuad.store((static_cast<std::int64_t>(playerQuadX) << 32U)
+                                   | static_cast<std::uint32_t>(playerQuadY),
+                               std::memory_order_relaxed);
+
+        const int configuredQuads = ConfigLoader::getSmoothedQuads();
+        const int quadRadius
+            = configuredQuads <= 0 ? std::numeric_limits<int>::max() : configuredQuads - 1;
+        const auto inRegion = [&](int quadX, int quadY) -> bool {
+            // The quad's cell must be inside the loaded grid (a cell is 2x2 quads; >> 1 is
+            // floor division, defined for negatives since C++20)...
+            const int cellDeltaX = (quadX >> 1) - center->cellX;
+            const int cellDeltaY = (quadY >> 1) - center->cellY;
+            if (std::max(std::abs(cellDeltaX), std::abs(cellDeltaY)) > loadedRadius) {
+                return false;
+            }
+            // ...and the quad inside the configured square around the player's quad
+            return std::max(std::abs(quadX - playerQuadX), std::abs(quadY - playerQuadY)) <= quadRadius;
         };
         const int level = ConfigLoader::getSubdivisions();
+        std::vector<std::pair<int, Job>> pendingBuilds;
 
         for (std::uint32_t gridX = 0; gridX < grid->length; ++gridX) {
             for (std::uint32_t gridY = 0; gridY < grid->length; ++gridY) {
@@ -202,27 +247,8 @@ void TerrainFalloff::recompute()
                     continue;
                 }
 
-                const int deltaX = coords->cellX - center->cellX;
-                const int deltaY = coords->cellY - center->cellY;
-                const bool wantSmooth = inRegion(deltaX, deltaY);
-
-                // Cell edges whose neighbor stays coarse get pinned to the vanilla edge line;
-                // a neighbor outside the loaded grid falls out of the same membership test
-                std::uint8_t linearEdges = 0;
-                if (wantSmooth) {
-                    if (!inRegion(deltaX - 1, deltaY)) {
-                        linearEdges |= TerrainSubdivision::K_EDGE_WEST;
-                    }
-                    if (!inRegion(deltaX + 1, deltaY)) {
-                        linearEdges |= TerrainSubdivision::K_EDGE_EAST;
-                    }
-                    if (!inRegion(deltaX, deltaY - 1)) {
-                        linearEdges |= TerrainSubdivision::K_EDGE_SOUTH;
-                    }
-                    if (!inRegion(deltaX, deltaY + 1)) {
-                        linearEdges |= TerrainSubdivision::K_EDGE_NORTH;
-                    }
-                }
+                const int cellQuadBaseX = coords->cellX * 2;
+                const int cellQuadBaseY = coords->cellY * 2;
 
                 // Resolve the shapes the cell actually renders through the scene graph, not
                 // through LoadedLandData::geom. The engine's land geometry init rebuilds all
@@ -250,10 +276,42 @@ void TerrainFalloff::recompute()
                         Entry& entry = found->second;
                         entry.seen = true;
 
-                        const auto edges = static_cast<std::uint8_t>(
-                            linearEdges & TerrainSubdivision::quadEdges(entry.quad));
+                        // This quad's place in the global landscape-quad lattice, and the
+                        // treatment of its four border lines - each pinned when the quad on
+                        // the other side (the other half of this cell or a neighboring
+                        // cell's quad alike) stays coarse
+                        const int quadX = cellQuadBaseX + static_cast<int>(entry.quad & 1U);
+                        const int quadY = cellQuadBaseY + static_cast<int>(entry.quad >> 1U);
+                        const bool wantSmooth = inRegion(quadX, quadY);
+                        std::uint8_t edges = 0;
+                        if (wantSmooth) {
+                            if (!inRegion(quadX - 1, quadY)) {
+                                edges |= TerrainSubdivision::K_EDGE_WEST;
+                            }
+                            if (!inRegion(quadX + 1, quadY)) {
+                                edges |= TerrainSubdivision::K_EDGE_EAST;
+                            }
+                            if (!inRegion(quadX, quadY - 1)) {
+                                edges |= TerrainSubdivision::K_EDGE_SOUTH;
+                            }
+                            if (!inRegion(quadX, quadY + 1)) {
+                                edges |= TerrainSubdivision::K_EDGE_NORTH;
+                            }
+                        }
                         if (wantSmooth == entry.wantSmoothed && (!wantSmooth || edges == entry.wantEdges)) {
                             continue; // already there, or already on its way there
+                        }
+
+                        if (wantSmooth && entry.snapshot == nullptr) {
+                            // The capture deferred from registration, done here because the
+                            // cell is loaded right now: its height tables and the engine's
+                            // CPU vertex copy (alive as long as the entry is) are both at hand
+                            auto* const vanillaData = entry.vanilla.rendererData;
+                            if (vanillaData == nullptr || vanillaData->rawVertexData == nullptr) {
+                                continue; // validated at registration; defensive
+                            }
+                            entry.snapshot = TerrainSubdivision::snapshotQuad(
+                                *land->loadedData, vanillaData->rawVertexData, entry.quad, entry.vertexDesc);
                         }
 
                         entry.generation = s_nextGeneration.fetch_add(1, std::memory_order_relaxed);
@@ -262,16 +320,32 @@ void TerrainFalloff::recompute()
                         if (!wantSmooth) {
                             revertEntry(entry); // instant: the vanilla buffers never went away
                         } else {
-                            enqueueJob(Job {.key = found->first,
-                                            .keepAlive = entry.shape,
-                                            .snapshot = entry.snapshot,
-                                            .level = level,
-                                            .linearEdges = edges,
-                                            .generation = entry.generation});
+                            pendingBuilds.emplace_back(
+                                std::max(std::abs(quadX - playerQuadX), std::abs(quadY - playerQuadY)),
+                                Job {.key = found->first,
+                                     .keepAlive = entry.shape,
+                                     .snapshot = entry.snapshot,
+                                     .level = level,
+                                     .linearEdges = edges,
+                                     .generation = entry.generation});
                         }
                     }
                 }
             }
+        }
+
+        // Nearest terrain first: after a load or a teleport the whole region builds at once,
+        // and the ground the player is actually looking at should stop being vanilla first
+        if (!pendingBuilds.empty()) {
+            std::sort(pendingBuilds.begin(),
+                      pendingBuilds.end(),
+                      [](const auto& jobA, const auto& jobB) -> bool { return jobA.first < jobB.first; });
+            std::vector<Job> jobs;
+            jobs.reserve(pendingBuilds.size());
+            for (auto& [distance, job] : pendingBuilds) {
+                jobs.push_back(std::move(job));
+            }
+            enqueueJobs(std::move(jobs));
         }
     } else {
         // No exterior grid around the player: everything still smoothed goes back to vanilla
@@ -285,6 +359,7 @@ void TerrainFalloff::recompute()
 
     // Everything the walk did not resolve is unverified: revert it, and prune it once nothing
     // else references it anymore.
+    std::vector<RE::NiPointer<RE::BSTriShape>> retired;
     const auto now = std::chrono::steady_clock::now();
     for (auto iter = s_entries.begin(); iter != s_entries.end();) {
         Entry& entry = iter->second;
@@ -311,7 +386,14 @@ void TerrainFalloff::recompute()
             ++iter;
             continue;
         }
+        // The last reference must not drop here: one crossing retires dozens of dead builder
+        // generations, and each destruction releases GPU buffers through the engine - a
+        // main-thread burst VR frames cannot absorb. The worker drops them instead.
+        retired.push_back(std::move(entry.shape));
         iter = s_entries.erase(iter);
+    }
+    if (!retired.empty()) {
+        buryShapes(std::move(retired));
     }
 }
 
@@ -359,28 +441,99 @@ void TerrainFalloff::applyBuiltMesh(const Job& job,
     entry.appliedEdges = job.linearEdges;
 }
 
-void TerrainFalloff::enqueueJob(Job&& job)
+void TerrainFalloff::ensureWorkerLocked()
 {
-    const std::lock_guard<std::mutex> lock(s_jobMutex);
     if (!s_workerStarted) {
         // Detached on purpose: joining at process exit would deadlock under the loader lock,
         // and the worker owns nothing that outlives the process
         std::thread(&TerrainFalloff::workerLoop).detach();
         s_workerStarted = true;
     }
-    s_jobs.push_back(std::move(job));
+}
+
+void TerrainFalloff::enqueueJobs(std::vector<Job>&& jobs)
+{
+    const std::lock_guard<std::mutex> lock(s_jobMutex);
+    ensureWorkerLocked();
+    for (auto& job : jobs) {
+        s_jobs.push_back(std::move(job));
+    }
     s_jobSignal.notify_one();
+}
+
+void TerrainFalloff::buryShapes(std::vector<RE::NiPointer<RE::BSTriShape>>&& shapes)
+{
+    const std::lock_guard<std::mutex> lock(s_jobMutex);
+    ensureWorkerLocked();
+    for (auto& shape : shapes) {
+        s_graveyard.push_back(std::move(shape));
+    }
+    s_jobSignal.notify_one();
+}
+
+void TerrainFalloff::pollPlayerQuad()
+{
+    auto* player = RE::PlayerCharacter::GetSingleton();
+    if (player == nullptr) {
+        return;
+    }
+    const auto position = player->GetPosition();
+    const auto quadX = static_cast<std::int32_t>(std::floor(position.x / TerrainSubdivision::K_QUAD_WORLD_SIZE));
+    const auto quadY = static_cast<std::int32_t>(std::floor(position.y / TerrainSubdivision::K_QUAD_WORLD_SIZE));
+    const auto packed = (static_cast<std::int64_t>(quadX) << 32U) | static_cast<std::uint32_t>(quadY);
+    if (s_lastPlayerQuad.exchange(packed, std::memory_order_relaxed) != packed) {
+        scheduleRecompute();
+    }
 }
 
 void TerrainFalloff::workerLoop()
 {
+    // Never latency-critical: the smoothing boundary sits at least a quad away, while the
+    // game's own threads fight for every core during cell loads - especially in VR
+    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
     for (;;) {
         Job job;
+        bool haveJob = false;
+        std::vector<RE::NiPointer<RE::BSTriShape>> retired;
         {
             std::unique_lock<std::mutex> lock(s_jobMutex);
-            s_jobSignal.wait(lock, []() { return !s_jobs.empty(); });
-            job = std::move(s_jobs.front());
-            s_jobs.pop_front();
+            // Timed wait: the wakeups double as the player-position poll below
+            s_jobSignal.wait_for(lock, K_PLAYER_POLL_INTERVAL, []() -> bool {
+                return !s_jobs.empty() || !s_graveyard.empty();
+            });
+            retired.swap(s_graveyard);
+            if (!s_jobs.empty()) {
+                job = std::move(s_jobs.front());
+                s_jobs.pop_front();
+                haveJob = true;
+            }
+        }
+
+        // Dropping these references here is the point: each destruction releases GPU buffers
+        // through the engine, off the main thread (the engine destroys shapes on its own
+        // loader threads the same way)
+        retired.clear();
+
+        // Quad crossings inside a cell have no engine event; this poll is what moves the
+        // region between cell borders
+        pollPlayerQuad();
+
+        if (!haveJob) {
+            continue;
+        }
+
+        // Hold the batch until the engine has not built land for a beat: a fresh registration
+        // means a cell load is in flight and every core is spoken for. Reverts are not gated
+        // by this - they are instant main-thread field writes.
+        for (;;) {
+            const auto lastBuild
+                = std::chrono::steady_clock::duration(s_lastLandBuild.load(std::memory_order_relaxed));
+            const auto sinceLastBuild = std::chrono::steady_clock::now().time_since_epoch() - lastBuild;
+            if (sinceLastBuild >= K_BUILD_QUIET_PERIOD) {
+                break;
+            }
+            std::this_thread::sleep_for(K_BUILD_QUIET_PERIOD - sinceLastBuild);
         }
 
         // Skip builds the player already outran; cheaper than building and discarding
@@ -393,6 +546,10 @@ void TerrainFalloff::workerLoop()
         }
 
         const auto mesh = TerrainSubdivision::buildSmoothedMesh(*job.snapshot, job.level, job.linearEdges);
+
+        // Trickle, not burst: the batch spreads over a few hundred milliseconds instead of
+        // slamming the driver with back-to-back uploads
+        std::this_thread::sleep_for(K_BUILD_SPACING);
 
         const auto* taskInterface = SKSE::GetTaskInterface();
         if (taskInterface == nullptr) {

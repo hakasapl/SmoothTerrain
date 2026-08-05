@@ -19,28 +19,30 @@ namespace SmoothTerrain {
  * @brief Subdivides the engine-built landscape meshes for smoother terrain
  *
  * The engine builds one BSTriShape per cell quadrant from the LAND record's 17x17 height grid
- * (BuildQuadTriShape, see Offsets.hpp). This class hooks every call site of that builder,
- * lets the vanilla builder run, then replaces the shape's GPU buffers with a subdivided version:
- * every original vertex is kept bit-exact in place and new vertices are interpolated in between.
- * Heights follow a Catmull-Rom spline over the whole cell - the original verts act as fixed
- * knots and both sides of every knot share one tangent, so the faceted creases of the vanilla
- * mesh disappear. The spline's tangents are limited against upward overshoot (see
- * limitedTangent), which holds every new vertex within a fixed number of world units of the
- * highest original vert around it and so keeps the subdivided mesh out of static meshes the
- * vanilla surface passed under; dips are left unbounded. Every other attribute is bilinear.
- * Materials, collision, multibounds and the
+ * (BuildQuadTriShape, see Offsets.hpp). This class hooks every call site of that builder and
+ * hands each freshly built vanilla quad to TerrainFalloff, which decides per cell - based on
+ * the player's position - when the quad renders a subdivided version and when the vanilla
+ * one. Nothing is ever built during the engine's own cell loading: subdivision happens later,
+ * off the main thread, and swapping is a handful of field writes (a cell streaming in shows
+ * its vanilla terrain for a beat before the smoothed mesh lands, which is the price of never
+ * adding work to a load spike).
+ *
+ * The subdivided mesh itself: every original vertex is kept bit-exact in place and new
+ * vertices are interpolated in between. Heights follow a Catmull-Rom spline over the whole
+ * cell - the original verts act as fixed knots and both sides of every knot share one
+ * tangent, so the faceted creases of the vanilla mesh disappear. The spline's tangents are
+ * limited against upward overshoot (see limitedTangent), which holds every new vertex within
+ * a fixed number of world units of the highest original vert around it and so keeps the
+ * subdivided mesh out of static meshes the vanilla surface passed under; dips are left
+ * unbounded. Every other attribute is bilinear. Materials, collision, multibounds and the
  * scene graph are untouched, so the change is invisible to other plugins - only the mesh
  * density changes.
  *
- * With the distance falloff enabled (iSmoothedGrids > 0, the default) the hook does not
- * subdivide at build time. It registers the freshly built vanilla quad with TerrainFalloff
- * instead, which decides per cell - based on the player's position - when to install a
- * smoothed mesh and when to bring the vanilla one back. This class then only supplies the
- * mesh machinery: snapshotQuad captures everything a later (possibly off-thread) build
- * needs, buildSmoothedMesh turns a snapshot into ready GPU buffers, and setMesh /
- * currentMesh / releaseMesh swap buffer sets on a shape without rebuilding anything.
- * A smoothed cell that borders unsmoothed terrain emits its border-line vertices on the
- * straight vanilla edge segments (see buildSmoothedMesh's linearEdges), so the two meshes
+ * This class supplies the mesh machinery: snapshotQuad captures everything a later
+ * (off-thread) build needs, buildSmoothedMesh turns a snapshot into ready GPU buffers, and
+ * setMesh / currentMesh / releaseMesh swap buffer sets on a shape without rebuilding
+ * anything. A smoothed cell that borders unsmoothed terrain emits its border-line vertices on
+ * the straight vanilla edge segments (see buildSmoothedMesh's linearEdges), so the two meshes
  * share their edge exactly and no cracks open between them.
  *
  * Call sites are patched with the SKSE trampoline (write_call) instead of a function-entry
@@ -163,11 +165,16 @@ private:
     static_assert(sizeof(IndexBufferData) == K_INDEX_DATA_SIZE);
 
 public:
+    constexpr static float K_QUAD_WORLD_SIZE = 2048.0F; /**< World units per landscape quad side; the falloff's
+                                                           distance unit (a cell is 2x2 quads) */
+    static_assert(K_QUAD_WORLD_SIZE == K_QUAD_SIZE, "the public quad size must match the mesh constants");
+
     //
-    // Cell edge flags, named from the cell's point of view (west = toward the cell at x - 1).
-    // TerrainFalloff flags the edges of a smoothed cell that face unsmoothed terrain; the mesh
-    // builder then pins the vertices on those border lines to the straight vanilla edge (see
-    // buildSmoothedMesh).
+    // Edge flags of one landscape quad, named from the quad's point of view (west = toward
+    // the quad at x - 1, which may be the other half of the same cell or a quad of the
+    // neighboring cell). TerrainFalloff flags the edges of a smoothed quad that face
+    // unsmoothed terrain; the mesh builder then pins the vertices on those border lines to
+    // the straight vanilla segments (see buildSmoothedMesh).
     //
     constexpr static std::uint8_t K_EDGE_WEST = 1U << 0U;
     constexpr static std::uint8_t K_EDGE_EAST = 1U << 1U;
@@ -208,46 +215,64 @@ public:
     };
 
     /**
-     * @brief Captures a vanilla-built quad's data for a later smoothed-mesh build
+     * @brief Checks that a shape is exactly the mesh the vanilla land builder makes
      *
-     * Runs the same validation the eager path uses (vanilla vertex/triangle counts, land
-     * vertex stride, CPU-side vertex copy present) and refuses anything that is not exactly
-     * the mesh the vanilla builder makes - another mod got there first, and leaving the shape
-     * alone is the safe outcome.
+     * Vanilla vertex/triangle counts, land vertex stride, CPU-side vertex copy present;
+     * anything else means another mod got there first and leaving the shape alone is the safe
+     * outcome. Validation is separate from snapshotQuad so the build hook can vet a quad
+     * without copying anything - the engine calls the builder 16 times per cell attach, and
+     * cell attach is exactly the moment the frame has no headroom to spare.
      *
      * Thread-safe; called from whichever thread the engine builds land on.
      *
-     * @param shape The vanilla-built 289-vert quad shape (only read)
-     * @param data Loaded land data of the cell (the height tables)
-     * @param quad Quadrant index 0-3 (0 = SW, 1 = SE, 2 = NW, 3 = NE)
-     * @return std::shared_ptr<const QuadSnapshot> The captured data, or nullptr when the shape
-     *         is not the vanilla land layout
+     * @param shape The freshly built quad shape (only read)
+     * @return std::optional<std::uint64_t> The shape's vertex descriptor (needed later by
+     *         snapshotQuad), or nullopt when the layout is not the vanilla one
      */
-    [[nodiscard]] static auto snapshotQuad(RE::BSTriShape& shape,
-                                           const RE::TESObjectLAND::LoadedLandData& data,
-                                           std::uint32_t quad) -> std::shared_ptr<const QuadSnapshot>;
+    [[nodiscard]] static auto validateQuadLayout(RE::BSTriShape& shape) -> std::optional<std::uint64_t>;
+
+    /**
+     * @brief Captures a validated quad's data for a smoothed-mesh build
+     *
+     * Pure capture, no validation (see validateQuadLayout): copies the vanilla vertex records
+     * and assembles the whole-cell height grid. Deferred until a build is actually wanted so
+     * that quads which never smooth - most of the loaded grid, plus the 15 dead builder
+     * generations per cell attach - never pay for the copies.
+     *
+     * @param data Loaded land data of the cell (the height tables; caller guarantees liveness)
+     * @param rawVertexData The vanilla CPU vertex copy validateQuadLayout confirmed present
+     * @param quad Quadrant index 0-3 (0 = SW, 1 = SE, 2 = NW, 3 = NE)
+     * @param vertexDesc The descriptor validateQuadLayout returned for this shape
+     * @return std::shared_ptr<const QuadSnapshot> The captured data
+     */
+    [[nodiscard]] static auto snapshotQuad(const RE::TESObjectLAND::LoadedLandData& data,
+                                           const void* rawVertexData,
+                                           std::uint32_t quad,
+                                           std::uint64_t vertexDesc) -> std::shared_ptr<const QuadSnapshot>;
 
     /**
      * @brief Builds ready-to-install smoothed buffers from a snapshot
      *
-     * The mesh generation of the eager path, callable from any thread: interpolates the fine
-     * vertex grid, then creates the GPU buffers through the engine's own creators (the same
-     * ones the vanilla land builder uses off-thread, so off-main creation is proven safe).
+     * Callable from any thread: interpolates the fine vertex grid, then creates the GPU
+     * buffers through the engine's own creators (the same ones the vanilla land builder uses
+     * off-thread, so off-main creation is proven safe).
      * Nothing is installed anywhere - the caller owns the result and must either setMesh it
      * or releaseMesh it.
      *
-     * Vertices on a border line named in linearEdges are pinned to the straight segments of
-     * the vanilla cell edge (heights become a plain lerp between the two bracketing original
-     * verts) instead of following the spline. An unsmoothed neighbor renders that exact
-     * straight edge, so the two meshes meet without cracks; the crease this leaves runs along
-     * one border line only and the rest of the quad keeps its full smoothing. Both cells of a
-     * smoothed-smoothed border derive the same spline from the same shared height line, so
-     * only edges facing unsmoothed terrain should ever be flagged.
+     * Vertices on one of this quad's four border lines named in linearEdges are pinned to
+     * the straight vanilla segments of that line (heights become a plain lerp between the
+     * two bracketing original verts) instead of following the spline. This works the same
+     * whether the flagged edge is a cell border or the cell's interior cross line between
+     * two quads of one cell: an unsmoothed neighbor quad renders straight segments between
+     * original verts along either kind of line, so the two meshes meet without cracks. The
+     * crease this leaves runs along that one line only and the rest of the quad keeps its
+     * full smoothing. Two smoothed quads sharing a line derive the same spline from the same
+     * shared height samples (the whole-cell grid inside a cell, the identical border column
+     * across cells), so only edges facing unsmoothed terrain should ever be flagged.
      *
      * @param snapshot A quad captured by snapshotQuad
      * @param level Subdivision level 1-3
-     * @param linearEdges K_EDGE_* flags of the cell edges to pin; only the two edges this
-     *        quadrant touches (see quadEdges) have any effect
+     * @param linearEdges K_EDGE_* flags of this quad's own border lines to pin
      * @return std::optional<MeshBuffers> The new buffers, or nullopt when the renderer refused
      *         them (out of GPU memory) or is unavailable
      */
@@ -283,14 +308,6 @@ public:
      */
     static void releaseMesh(const MeshBuffers& mesh);
 
-    /**
-     * @brief The two cell edges a quadrant's mesh touches
-     *
-     * @param quad Quadrant index 0-3 (0 = SW, 1 = SE, 2 = NW, 3 = NE)
-     * @return std::uint8_t K_EDGE_* mask, e.g. west | south for the SW quadrant
-     */
-    [[nodiscard]] static auto quadEdges(std::uint32_t quad) -> std::uint8_t;
-
 private:
     /**
      * @brief Call-site hook around the engine's BuildQuadTriShape
@@ -313,23 +330,6 @@ public:
     TerrainSubdivision() = delete;
 
 private:
-    /**
-     * @brief Replaces a freshly built quad shape's buffers with a subdivided version
-     *
-     * On any unexpected input (foreign vertex layout, missing CPU copy, buffer creation
-     * failure) the shape is left exactly as the vanilla builder made it.
-     *
-     * @param shape The vanilla-built 289-vert quad shape (modified in place)
-     * @param data Loaded land data of the cell (heights and cell coordinates)
-     * @param quad Quadrant index 0-3 (0 = SW, 1 = SE, 2 = NW, 3 = NE)
-     * @param level Subdivision level 1-3
-     * @return bool True when the shape now holds the subdivided buffers
-     */
-    static auto subdivide(RE::BSTriShape& shape,
-                          const RE::TESObjectLAND::LoadedLandData& data,
-                          std::uint32_t quad,
-                          int level) -> bool;
-
     /**
      * @brief Assembles the full 33x33 cell height grid from the four 17x17 quadrant grids
      *

@@ -118,79 +118,57 @@ auto TerrainSubdivision::BuildQuadHook::thunk(RE::TESObjectLAND::LoadedLandData*
     // Vanilla builds the 17x17 quad first (through any detours other mods put on it)
     auto* shape = s_func(data, quad);
 
-    const int level = ConfigLoader::getSubdivisions();
-    if (shape == nullptr || data == nullptr || quad >= 4 || level <= 0) {
+    if (shape == nullptr || data == nullptr || quad >= 4 || ConfigLoader::getSubdivisions() <= 0) {
         return shape;
     }
 
-    // With the falloff active every quad starts out vanilla; TerrainFalloff installs the
-    // smoothed mesh from the main thread once the cell is close enough to the player
+    // Every quad starts out vanilla, always: subdividing here would put full mesh generation
+    // and a GPU upload inside the engine's cell loading, 16 times per cell - the load-time
+    // hitch this plugin is structured to avoid. TerrainFalloff installs the smoothed mesh
+    // from the main thread later, built in the background.
     if (TerrainFalloff::isEnabled()) {
-        TerrainFalloff::registerQuad(shape, *data, quad);
-        return shape;
-    }
-
-    if (!subdivide(*shape, *data, quad, level)) {
-        // Anything unexpected leaves the vanilla mesh in place; log at debug to avoid spam
-        spdlog::debug("Quad {} kept its vanilla land mesh", quad);
+        TerrainFalloff::registerQuad(shape, quad);
     }
     return shape;
 }
 
-auto TerrainSubdivision::subdivide(RE::BSTriShape& shape,
-                                   const RE::TESObjectLAND::LoadedLandData& data,
-                                   std::uint32_t quad,
-                                   int level) -> bool
-{
-    const auto snapshot = snapshotQuad(shape, data, quad);
-    if (snapshot == nullptr) {
-        return false;
-    }
-
-    // All-or-nothing swap: create everything first, only then touch the shape. Safe off the
-    // main thread here because the freshly built shape is not attached to anything yet.
-    const auto mesh = buildSmoothedMesh(*snapshot, level, 0);
-    if (!mesh.has_value()) {
-        return false;
-    }
-
-    releaseMesh(currentMesh(shape));
-    setMesh(shape, *mesh);
-    return true;
-}
-
-auto TerrainSubdivision::snapshotQuad(RE::BSTriShape& shape,
-                                      const RE::TESObjectLAND::LoadedLandData& data,
-                                      std::uint32_t quad) -> std::shared_ptr<const QuadSnapshot>
+auto TerrainSubdivision::validateQuadLayout(RE::BSTriShape& shape) -> std::optional<std::uint64_t>
 {
     // The vanilla CPU-side vertex copy is the interpolation source for every attribute.
     // Geometry members live behind CommonLibSSE-NG's runtime accessors so their per-runtime
     // offsets resolve correctly.
     auto& geometryData = shape.GetGeometryRuntimeData();
     auto& triShapeData = shape.GetTrishapeRuntimeData();
-    auto* const oldData = geometryData.rendererData;
-    if ((oldData == nullptr) || (oldData->rawVertexData == nullptr)) {
-        return nullptr;
+    auto* const rendererData = geometryData.rendererData;
+    if ((rendererData == nullptr) || (rendererData->rawVertexData == nullptr)) {
+        return std::nullopt;
     }
 
     // Only touch exactly the mesh the vanilla builder makes; any other layout means another
     // mod got here first (or the pipeline changed) and vanilla is the safe outcome
     if (triShapeData.vertexCount != K_COARSE_VERTS || triShapeData.triangleCount != K_COARSE_TRIS) {
-        return nullptr;
+        return std::nullopt;
     }
     const auto desc = std::bit_cast<std::uint64_t>(geometryData.vertexDesc);
     constexpr std::uint64_t DESC_STRIDE_MASK = 0xF; // the desc's low nibble holds the stride in dwords
     if ((desc & DESC_STRIDE_MASK) * sizeof(std::uint32_t) != sizeof(LandVertex)) {
-        return nullptr;
+        return std::nullopt;
     }
+    return desc;
+}
 
+auto TerrainSubdivision::snapshotQuad(const RE::TESObjectLAND::LoadedLandData& data,
+                                      const void* rawVertexData,
+                                      std::uint32_t quad,
+                                      std::uint64_t vertexDesc) -> std::shared_ptr<const QuadSnapshot>
+{
     // Copy everything a build needs out of the engine structures; the snapshot must stay
     // usable after the cell unloads or the shape changes hands (see the header)
     auto snapshot = std::make_shared<QuadSnapshot>();
-    std::memcpy(snapshot->coarse.data(), oldData->rawVertexData, sizeof(snapshot->coarse));
+    std::memcpy(snapshot->coarse.data(), rawVertexData, sizeof(snapshot->coarse));
     buildCellHeightGrid(data, snapshot->heights);
     snapshot->quad = quad;
-    snapshot->vertexDesc = desc;
+    snapshot->vertexDesc = vertexDesc;
     return snapshot;
 }
 
@@ -222,7 +200,6 @@ auto TerrainSubdivision::buildSmoothedMesh(const QuadSnapshot& snapshot,
 
     const float smoothness = ConfigLoader::getSmoothness();
     const float maxRise = ConfigLoader::getMaxRise();
-    constexpr int LAST = static_cast<int>(K_CELL_DIM) - 1;
 
     std::vector<LandVertex> fine(fineVerts);
     for (std::uint32_t j = 0; j < fineDim; ++j) {
@@ -254,20 +231,23 @@ auto TerrainSubdivision::buildSmoothedMesh(const QuadSnapshot& snapshot,
             out.posX = baseX + (static_cast<float>(i) * step);
             out.posY = baseY + (static_cast<float>(j) * step);
 
-            // A vertex on a pinned border line takes the straight vanilla edge instead of the
-            // spline: an unsmoothed neighbor renders exactly this line, so the two meshes meet
-            // without a crack. Only the height changes; the bilinear attributes above already
-            // collapse to the shared edge records and match the neighbor's shading. A vertex
-            // cannot satisfy both tests at once - that would need fracX == fracY == 0, the
+            // A vertex on a pinned border line takes the straight vanilla segments instead of
+            // the spline: an unsmoothed neighbor quad renders exactly this line, whether it is
+            // a cell border or the cell's interior cross line, so the two meshes meet without
+            // a crack. Only the height changes; the bilinear attributes above already collapse
+            // to the shared edge records and match the neighbor's shading. A vertex cannot
+            // satisfy both tests at once - that would need fracX == fracY == 0, the
             // original-vert case handled above.
             const int gx = gridBaseX + static_cast<int>(coarseX);
             const int gy = gridBaseY + static_cast<int>(coarseY);
             const bool pinX = fracX == 0.0F
-                && ((((linearEdges & K_EDGE_WEST) != 0) && gx == 0)
-                    || (((linearEdges & K_EDGE_EAST) != 0) && gx == LAST));
+                && ((((linearEdges & K_EDGE_WEST) != 0) && gx == gridBaseX)
+                    || (((linearEdges & K_EDGE_EAST) != 0)
+                        && gx == gridBaseX + static_cast<int>(K_COARSE_DIM) - 1));
             const bool pinY = fracY == 0.0F
-                && ((((linearEdges & K_EDGE_SOUTH) != 0) && gy == 0)
-                    || (((linearEdges & K_EDGE_NORTH) != 0) && gy == LAST));
+                && ((((linearEdges & K_EDGE_SOUTH) != 0) && gy == gridBaseY)
+                    || (((linearEdges & K_EDGE_NORTH) != 0)
+                        && gy == gridBaseY + static_cast<int>(K_COARSE_DIM) - 1));
             if (pinX) {
                 out.posZ = lerp(gridHeight(grid, gx, gy), gridHeight(grid, gx, gy + 1), fracY);
             } else if (pinY) {
@@ -349,12 +329,6 @@ void TerrainSubdivision::setMesh(RE::BSTriShape& shape,
 }
 
 void TerrainSubdivision::releaseMesh(const MeshBuffers& mesh) { releaseRendererData(mesh.rendererData); }
-
-auto TerrainSubdivision::quadEdges(std::uint32_t quad) -> std::uint8_t
-{
-    return static_cast<std::uint8_t>((((quad & 1U) != 0) ? K_EDGE_EAST : K_EDGE_WEST)
-                                     | (((quad >> 1U) != 0) ? K_EDGE_NORTH : K_EDGE_SOUTH));
-}
 
 void TerrainSubdivision::buildCellHeightGrid(const RE::TESObjectLAND::LoadedLandData& data,
                                              std::array<std::array<float,
