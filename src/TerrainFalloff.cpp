@@ -44,11 +44,19 @@ void TerrainFalloff::install()
                      "smoothed mesh, built in the background shortly after its cell loads");
     } else {
         const int side = (2 * ConfigLoader::getSmoothedQuads()) - 1;
-        spdlog::info("Distance falloff active: a {0}x{0} landscape-quad square around the player renders the "
-                     "smoothed mesh (radius {1} counting the player's quad; a quad is half a grid, 2048 units); "
-                     "everything further renders the vanilla mesh",
-                     side,
-                     ConfigLoader::getSmoothedQuads());
+        if (ConfigLoader::getGradientStep() > 0) {
+            spdlog::info("Distance falloff active: a {0}x{0} landscape-quad square around the player renders "
+                         "subdivision level {1} (a quad is half a grid, 2048 units), and the level drops by one "
+                         "every {2} quad(s) beyond it until terrain is vanilla",
+                         side,
+                         ConfigLoader::getSubdivisions(),
+                         ConfigLoader::getGradientStep());
+        } else {
+            spdlog::info("Distance falloff active: a {0}x{0} landscape-quad square around the player renders the "
+                         "smoothed mesh (a quad is half a grid, 2048 units); everything further renders the "
+                         "vanilla mesh (iGradientStep = 0, no gradient)",
+                         side);
+        }
     }
 }
 
@@ -218,18 +226,29 @@ void TerrainFalloff::recompute()
         const int configuredQuads = ConfigLoader::getSmoothedQuads();
         const int quadRadius
             = configuredQuads <= 0 ? std::numeric_limits<int>::max() : configuredQuads - 1;
-        const auto inRegion = [&](int quadX, int quadY) -> bool {
-            // The quad's cell must be inside the loaded grid (a cell is 2x2 quads; >> 1 is
-            // floor division, defined for negatives since C++20)...
+        const int gradientStep = ConfigLoader::getGradientStep();
+        const int maxLevel = ConfigLoader::getSubdivisions();
+        const auto levelAt = [&](int quadX, int quadY) -> int {
+            // A quad whose cell is outside the loaded grid has no mesh and counts as vanilla
+            // (a cell is 2x2 quads; >> 1 is floor division, defined for negatives since C++20)
             const int cellDeltaX = (quadX >> 1) - center->cellX;
             const int cellDeltaY = (quadY >> 1) - center->cellY;
             if (std::max(std::abs(cellDeltaX), std::abs(cellDeltaY)) > loadedRadius) {
-                return false;
+                return 0;
             }
-            // ...and the quad inside the configured square around the player's quad
-            return std::max(std::abs(quadX - playerQuadX), std::abs(quadY - playerQuadY)) <= quadRadius;
+            // Full level inside the configured square around the player's quad, then one
+            // level less every gradientStep quads of distance - or straight to vanilla when
+            // the gradient is off
+            const int distance = std::max(std::abs(quadX - playerQuadX), std::abs(quadY - playerQuadY));
+            if (distance <= quadRadius) {
+                return maxLevel;
+            }
+            if (gradientStep <= 0) {
+                return 0;
+            }
+            const int stepsLost = ((distance - quadRadius) + gradientStep - 1) / gradientStep;
+            return std::max(0, maxLevel - stepsLost);
         };
-        const int level = ConfigLoader::getSubdivisions();
         std::vector<std::pair<int, Job>> pendingBuilds;
 
         for (std::uint32_t gridX = 0; gridX < grid->length; ++gridX) {
@@ -276,33 +295,29 @@ void TerrainFalloff::recompute()
                         Entry& entry = found->second;
                         entry.seen = true;
 
-                        // This quad's place in the global landscape-quad lattice, and the
-                        // treatment of its four border lines - each pinned when the quad on
-                        // the other side (the other half of this cell or a neighboring
-                        // cell's quad alike) stays coarse
+                        // This quad's place in the global landscape-quad lattice, its target
+                        // level, and the level of its four border lines - each the minimum
+                        // with the quad on the other side (the other half of this cell or a
+                        // neighboring cell's quad alike)
                         const int quadX = cellQuadBaseX + static_cast<int>(entry.quad & 1U);
                         const int quadY = cellQuadBaseY + static_cast<int>(entry.quad >> 1U);
-                        const bool wantSmooth = inRegion(quadX, quadY);
-                        std::uint8_t edges = 0;
-                        if (wantSmooth) {
-                            if (!inRegion(quadX - 1, quadY)) {
-                                edges |= TerrainSubdivision::K_EDGE_WEST;
-                            }
-                            if (!inRegion(quadX + 1, quadY)) {
-                                edges |= TerrainSubdivision::K_EDGE_EAST;
-                            }
-                            if (!inRegion(quadX, quadY - 1)) {
-                                edges |= TerrainSubdivision::K_EDGE_SOUTH;
-                            }
-                            if (!inRegion(quadX, quadY + 1)) {
-                                edges |= TerrainSubdivision::K_EDGE_NORTH;
-                            }
+                        const int quadLevel = levelAt(quadX, quadY);
+                        TerrainSubdivision::EdgeLevels edgeLevels {};
+                        if (quadLevel > 0) {
+                            const auto sharedLevel = [&](int neighborX, int neighborY) -> std::uint8_t {
+                                return static_cast<std::uint8_t>(std::min(quadLevel, levelAt(neighborX, neighborY)));
+                            };
+                            edgeLevels = TerrainSubdivision::EdgeLevels {.west = sharedLevel(quadX - 1, quadY),
+                                                                        .east = sharedLevel(quadX + 1, quadY),
+                                                                        .south = sharedLevel(quadX, quadY - 1),
+                                                                        .north = sharedLevel(quadX, quadY + 1)};
                         }
-                        if (wantSmooth == entry.wantSmoothed && (!wantSmooth || edges == entry.wantEdges)) {
+                        if (entry.wantLevel == quadLevel
+                            && (quadLevel == 0 || edgeLevels == entry.wantEdgeLevels)) {
                             continue; // already there, or already on its way there
                         }
 
-                        if (wantSmooth && entry.snapshot == nullptr) {
+                        if (quadLevel > 0 && entry.snapshot == nullptr) {
                             // The capture deferred from registration, done here because the
                             // cell is loaded right now: its height tables and the engine's
                             // CPU vertex copy (alive as long as the entry is) are both at hand
@@ -315,9 +330,9 @@ void TerrainFalloff::recompute()
                         }
 
                         entry.generation = s_nextGeneration.fetch_add(1, std::memory_order_relaxed);
-                        entry.wantSmoothed = wantSmooth;
-                        entry.wantEdges = edges;
-                        if (!wantSmooth) {
+                        entry.wantLevel = static_cast<std::uint8_t>(quadLevel);
+                        entry.wantEdgeLevels = edgeLevels;
+                        if (quadLevel == 0) {
                             revertEntry(entry); // instant: the vanilla buffers never went away
                         } else {
                             pendingBuilds.emplace_back(
@@ -325,8 +340,8 @@ void TerrainFalloff::recompute()
                                 Job {.key = found->first,
                                      .keepAlive = entry.shape,
                                      .snapshot = entry.snapshot,
-                                     .level = level,
-                                     .linearEdges = edges,
+                                     .level = quadLevel,
+                                     .edgeLevels = edgeLevels,
                                      .generation = entry.generation});
                         }
                     }
@@ -350,7 +365,7 @@ void TerrainFalloff::recompute()
     } else {
         // No exterior grid around the player: everything still smoothed goes back to vanilla
         for (auto& [key, entry] : s_entries) {
-            if (entry.smoothed.has_value() || entry.wantSmoothed) {
+            if (entry.smoothed.has_value() || entry.wantLevel != 0) {
                 entry.generation = s_nextGeneration.fetch_add(1, std::memory_order_relaxed);
                 revertEntry(entry);
             }
@@ -374,7 +389,7 @@ void TerrainFalloff::recompute()
         // first resolved pass). This also restores the vanilla buffers ahead of the erase
         // below, so a dying shape's destructor releases them exactly as if this plugin had
         // never touched the quad.
-        if (entry.smoothed.has_value() || entry.wantSmoothed) {
+        if (entry.smoothed.has_value() || entry.wantLevel != 0) {
             entry.generation = s_nextGeneration.fetch_add(1, std::memory_order_relaxed);
             revertEntry(entry);
         }
@@ -404,9 +419,10 @@ void TerrainFalloff::revertEntry(Entry& entry)
         TerrainSubdivision::releaseMesh(*entry.smoothed);
         entry.smoothed.reset();
     }
-    entry.appliedEdges = 0;
-    entry.wantSmoothed = false;
-    entry.wantEdges = 0;
+    entry.appliedLevel = 0;
+    entry.appliedEdgeLevels = {};
+    entry.wantLevel = 0;
+    entry.wantEdgeLevels = {};
 }
 
 void TerrainFalloff::applyBuiltMesh(const Job& job,
@@ -427,18 +443,19 @@ void TerrainFalloff::applyBuiltMesh(const Job& job,
         // The renderer refused the buffers (likely GPU memory); resetting the target to the
         // current state lets the next region change retry instead of wedging the quad
         spdlog::warn("Smoothed land mesh build failed; quad {} keeps its current mesh for now", entry.quad);
-        entry.wantSmoothed = entry.smoothed.has_value();
-        entry.wantEdges = entry.appliedEdges;
+        entry.wantLevel = entry.appliedLevel;
+        entry.wantEdgeLevels = entry.appliedEdgeLevels;
         return;
     }
 
     // The swap itself: a few field writes on the main thread, no allocation, no upload
     TerrainSubdivision::setMesh(*entry.shape, *mesh);
     if (entry.smoothed.has_value()) {
-        TerrainSubdivision::releaseMesh(*entry.smoothed); // an older smoothed variant
+        TerrainSubdivision::releaseMesh(*entry.smoothed); // an older variant or level
     }
     entry.smoothed = *mesh;
-    entry.appliedEdges = job.linearEdges;
+    entry.appliedLevel = static_cast<std::uint8_t>(job.level);
+    entry.appliedEdgeLevels = job.edgeLevels;
 }
 
 void TerrainFalloff::ensureWorkerLocked()
@@ -545,7 +562,7 @@ void TerrainFalloff::workerLoop()
             }
         }
 
-        const auto mesh = TerrainSubdivision::buildSmoothedMesh(*job.snapshot, job.level, job.linearEdges);
+        const auto mesh = TerrainSubdivision::buildSmoothedMesh(*job.snapshot, job.level, job.edgeLevels);
 
         // Trickle, not burst: the batch spreads over a few hundred milliseconds instead of
         // slamming the driver with back-to-back uploads
@@ -555,6 +572,14 @@ void TerrainFalloff::workerLoop()
         if (taskInterface == nullptr) {
             if (mesh.has_value()) {
                 TerrainSubdivision::releaseMesh(*mesh);
+            }
+            // Reset the target like applyBuiltMesh's failure path would have, so a later
+            // region change retries instead of believing this level is on its way
+            const std::lock_guard<std::mutex> lock(s_entryMutex);
+            const auto found = s_entries.find(job.key);
+            if (found != s_entries.end() && found->second.generation == job.generation) {
+                found->second.wantLevel = found->second.appliedLevel;
+                found->second.wantEdgeLevels = found->second.appliedEdgeLevels;
             }
             continue;
         }

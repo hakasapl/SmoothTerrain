@@ -23,16 +23,18 @@ namespace SmoothTerrain {
  * without stutter as the player moves
  *
  * The build hook never subdivides at build time; every land quad starts with its vanilla
- * mesh and is registered here instead. This class then maintains the invariant that exactly
- * the landscape quads within the configured square around the quad under the player (a
- * Chebyshev radius in quad units - a quad is a quarter cell, 2048 world units - counting the
- * player's own quad, so 2 covers the 3x3 quad square) render the smoothed mesh, and
- * everything further out renders vanilla. Quad units mean the boundary moves at half-cell
- * resolution and keeps a consistent distance from the player wherever they stand in a cell;
- * two quads of one cell can differ, with their shared interior line stitched exactly like a
- * cell border. The square is capped at the game's actual loaded grid, read from the grid
- * array itself at runtime; iSmoothedQuads = 0 lifts the distance limit, which is simply the
- * square covering the whole loaded grid - the builds still run through the same background
+ * mesh and is registered here instead. This class then maintains a level map over the
+ * landscape quads around the quad under the player (Chebyshev distance in quad units - a
+ * quad is a quarter cell, 2048 world units): the full iSubdivisions level within the
+ * iSmoothedQuads square (its radius counts the player's own quad, so 2 covers the 3x3 quad
+ * square), and beyond it one level less every iGradientStep quads of distance until the
+ * terrain is vanilla - or straight to vanilla when the gradient is off (iGradientStep = 0).
+ * Quad units mean every boundary moves at half-cell resolution and keeps a consistent
+ * distance from the player wherever they stand in a cell; two quads of one cell can differ,
+ * with their shared interior line stitched exactly like a cell border. Everything is capped
+ * at the game's actual loaded grid, read from the grid array itself at runtime;
+ * iSmoothedQuads = 0 lifts the distance limit, which is simply the full-level square
+ * covering the whole loaded grid - the builds still run through the same background
  * machinery, never inside a cell load.
  *
  * The stutter-free part rests on three legs:
@@ -68,13 +70,16 @@ namespace SmoothTerrain {
  * generations also pass through the registry; they are never found in the scene graph and
  * fall out through the prune pass once the engine drops them.
  *
- * Stitching: a smoothed cell whose neighbor stays coarse gets that edge flagged, and the mesh
- * builder pins the vertices on that border line to the straight vanilla edge (see
- * TerrainSubdivision::buildSmoothedMesh). Because the region is a square in cell coordinates,
- * whether an edge is flagged is pure coordinate math and both cells of any shared edge always
- * agree on its treatment, so no cracks can open anywhere: smoothed-smoothed borders share the
- * same spline, smoothed-coarse borders share the straight vanilla line, and every corner vert
- * is an original LAND vert that is bit-exact in all variants.
+ * Stitching: every shared border line renders at the minimum of the two adjacent quads'
+ * levels - the finer side pins its extra border vertices onto the coarser side's edge
+ * polyline, down to the straight vanilla segments against unsmoothed terrain (see
+ * TerrainSubdivision::buildSmoothedMesh). Because a quad's level is pure coordinate math,
+ * both quads of any shared line always agree on that minimum, so no cracks can open
+ * anywhere: equal-level borders share the same spline, unequal ones share the coarser
+ * polyline, and every corner vert is an original LAND vert that is bit-exact in all
+ * variants. The gradient never puts adjacent quads more than one level apart (distance
+ * changes by at most one quad between neighbors), except against unloaded cells, where the
+ * pin drops straight to the vanilla line the distant LOD was authored against.
  *
  * While a region shift is still in flight the two sides of an edge can briefly disagree
  * (quads apply as their builds finish, not as one atomic batch). The mismatch is bounded by
@@ -168,9 +173,10 @@ private:
         std::uint32_t quad {}; /**< Quadrant index 0-3 */
         TerrainSubdivision::MeshBuffers vanilla; /**< The engine's own buffers, kept alive for instant reverts */
         std::optional<TerrainSubdivision::MeshBuffers> smoothed; /**< The smoothed set currently installed */
-        std::uint8_t appliedEdges {}; /**< linearEdges mask the installed smoothed set was built with */
-        bool wantSmoothed {}; /**< Target state as of the last region pass (may still be in flight) */
-        std::uint8_t wantEdges {}; /**< Target linearEdges mask */
+        std::uint8_t appliedLevel {}; /**< Subdivision level of the installed set (0 while vanilla renders) */
+        TerrainSubdivision::EdgeLevels appliedEdgeLevels {}; /**< Edge levels the installed set was built with */
+        std::uint8_t wantLevel {}; /**< Target level as of the last region pass (may still be in flight) */
+        TerrainSubdivision::EdgeLevels wantEdgeLevels {}; /**< Target edge levels */
         std::uint64_t generation {}; /**< Globally unique id a worker result must match to be applied */
         std::chrono::steady_clock::time_point registeredAt; /**< For the prune age guard */
         bool seen {}; /**< Scratch flag of the current region pass: found in the loaded grid */
@@ -188,7 +194,7 @@ private:
         RE::NiPointer<RE::BSTriShape> keepAlive;
         std::shared_ptr<const TerrainSubdivision::QuadSnapshot> snapshot;
         int level {};
-        std::uint8_t linearEdges {};
+        TerrainSubdivision::EdgeLevels edgeLevels {};
         std::uint64_t generation {};
     };
 

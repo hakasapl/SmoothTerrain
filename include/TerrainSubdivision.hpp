@@ -41,9 +41,11 @@ namespace SmoothTerrain {
  * This class supplies the mesh machinery: snapshotQuad captures everything a later
  * (off-thread) build needs, buildSmoothedMesh turns a snapshot into ready GPU buffers, and
  * setMesh / currentMesh / releaseMesh swap buffer sets on a shape without rebuilding
- * anything. A smoothed cell that borders unsmoothed terrain emits its border-line vertices on
- * the straight vanilla edge segments (see buildSmoothedMesh's linearEdges), so the two meshes
- * share their edge exactly and no cracks open between them.
+ * anything. Neighboring quads may render at different levels (the falloff can step the level
+ * down with distance); the finer quad then emits its border-line vertices on the coarser
+ * neighbor's edge polyline - down to the straight vanilla segments against unsmoothed
+ * terrain - so the two meshes share their edge exactly and no cracks open between them (see
+ * buildSmoothedMesh's edgeLevels).
  *
  * Call sites are patched with the SKSE trampoline (write_call) instead of a function-entry
  * detour, so other mods (Community Shaders, ENB, ...) can still detour the builder or anything
@@ -169,17 +171,24 @@ public:
                                                            distance unit (a cell is 2x2 quads) */
     static_assert(K_QUAD_WORLD_SIZE == K_QUAD_SIZE, "the public quad size must match the mesh constants");
 
-    //
-    // Edge flags of one landscape quad, named from the quad's point of view (west = toward
-    // the quad at x - 1, which may be the other half of the same cell or a quad of the
-    // neighboring cell). TerrainFalloff flags the edges of a smoothed quad that face
-    // unsmoothed terrain; the mesh builder then pins the vertices on those border lines to
-    // the straight vanilla segments (see buildSmoothedMesh).
-    //
-    constexpr static std::uint8_t K_EDGE_WEST = 1U << 0U;
-    constexpr static std::uint8_t K_EDGE_EAST = 1U << 1U;
-    constexpr static std::uint8_t K_EDGE_SOUTH = 1U << 2U;
-    constexpr static std::uint8_t K_EDGE_NORTH = 1U << 3U;
+    /**
+     * @brief Target mesh level of a quad's four border lines, named from the quad's point of
+     * view (west = toward the quad at x - 1, which may be the other half of the same cell or
+     * a quad of the neighboring cell)
+     *
+     * A border line renders at the minimum of the two adjacent quads' subdivision levels, so
+     * the finer side always adapts to the coarser one (see buildSmoothedMesh). An entry equal
+     * to the build level means the full spline (nothing to adapt to), 0 means the straight
+     * vanilla segments.
+     */
+    struct EdgeLevels {
+        std::uint8_t west {};
+        std::uint8_t east {};
+        std::uint8_t south {};
+        std::uint8_t north {};
+
+        [[nodiscard]] auto operator==(const EdgeLevels&) const -> bool = default;
+    };
 
     /**
      * @brief One complete, installable set of land mesh buffers plus the shape fields that
@@ -259,26 +268,27 @@ public:
      * Nothing is installed anywhere - the caller owns the result and must either setMesh it
      * or releaseMesh it.
      *
-     * Vertices on one of this quad's four border lines named in linearEdges are pinned to
-     * the straight vanilla segments of that line (heights become a plain lerp between the
-     * two bracketing original verts) instead of following the spline. This works the same
-     * whether the flagged edge is a cell border or the cell's interior cross line between
-     * two quads of one cell: an unsmoothed neighbor quad renders straight segments between
-     * original verts along either kind of line, so the two meshes meet without cracks. The
-     * crease this leaves runs along that one line only and the rest of the quad keeps its
-     * full smoothing. Two smoothed quads sharing a line derive the same spline from the same
-     * shared height samples (the whole-cell grid inside a cell, the identical border column
-     * across cells), so only edges facing unsmoothed terrain should ever be flagged.
+     * Vertices on one of this quad's four border lines whose EdgeLevels entry is below the
+     * build level are pinned onto the coarser neighbor's edge polyline: the neighbor's own
+     * vertices along the shared line are spline samples at its coarser step (or the original
+     * LAND verts at level 0), and this mesh's extra vertices in between land exactly on the
+     * straight segments the neighbor renders between them. This works the same whether the
+     * line is a cell border or the cell's interior cross line between two quads of one cell.
+     * Vertices at positions both sides share evaluate the very same interpolation over the
+     * very same shared height samples (the whole-cell grid inside a cell, the identical
+     * border column across cells), so they match bit for bit and the meshes meet without
+     * cracks; only the segments between them flatten, and the rest of the quad keeps its
+     * full smoothing. Edges between equal-level quads need no pinning.
      *
      * @param snapshot A quad captured by snapshotQuad
      * @param level Subdivision level 1-3
-     * @param linearEdges K_EDGE_* flags of this quad's own border lines to pin
+     * @param edgeLevels Per-edge render level of this quad's four border lines, each 0..level
      * @return std::optional<MeshBuffers> The new buffers, or nullopt when the renderer refused
      *         them (out of GPU memory) or is unavailable
      */
     [[nodiscard]] static auto buildSmoothedMesh(const QuadSnapshot& snapshot,
                                                 int level,
-                                                std::uint8_t linearEdges) -> std::optional<MeshBuffers>;
+                                                const EdgeLevels& edgeLevels) -> std::optional<MeshBuffers>;
 
     /**
      * @brief Reads the buffer set a shape currently renders with

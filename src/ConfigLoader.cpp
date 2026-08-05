@@ -35,11 +35,16 @@ void ConfigLoader::loadConfig()
         std::clamp(readIniFloat(iniPath, L"iSmoothedQuads", DEFAULT_SMOOTHED_QUADS), 0.0F, SMOOTHED_QUADS_PARSE_CAP));
     s_config.smoothedQuads = rawQuads <= 0 ? 0 : std::max(rawQuads, MIN_SMOOTHED_QUADS);
 
+    // 0 disables the gradient (straight to vanilla past the full-level square)
+    s_config.gradientStep = static_cast<int>(
+        std::clamp(readIniFloat(iniPath, L"iGradientStep", DEFAULT_GRADIENT_STEP), 0.0F, SMOOTHED_QUADS_PARSE_CAP));
+
     // Log the effective values so user reports include them
     spdlog::info("Config Loaded: Subdivisions: {}", s_config.subdivisions);
     spdlog::info("Config Loaded: Smoothness: {}", s_config.smoothness);
     spdlog::info("Config Loaded: Max Rise: {}", s_config.maxRise);
     spdlog::info("Config Loaded: Smoothed Quads: {}", s_config.smoothedQuads);
+    spdlog::info("Config Loaded: Gradient Step: {}", s_config.gradientStep);
 }
 
 auto ConfigLoader::getSubdivisions() -> int { return s_config.subdivisions; }
@@ -49,6 +54,8 @@ auto ConfigLoader::getSmoothness() -> float { return s_config.smoothness; }
 auto ConfigLoader::getMaxRise() -> float { return s_config.maxRise; }
 
 auto ConfigLoader::getSmoothedQuads() -> int { return s_config.smoothedQuads; }
+
+auto ConfigLoader::getGradientStep() -> int { return s_config.gradientStep; }
 
 auto ConfigLoader::readIniFloat(const std::filesystem::path& path,
                                 const wchar_t* key,

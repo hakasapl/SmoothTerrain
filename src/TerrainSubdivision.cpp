@@ -174,7 +174,7 @@ auto TerrainSubdivision::snapshotQuad(const RE::TESObjectLAND::LoadedLandData& d
 
 auto TerrainSubdivision::buildSmoothedMesh(const QuadSnapshot& snapshot,
                                            int level,
-                                           std::uint8_t linearEdges) -> std::optional<MeshBuffers>
+                                           const EdgeLevels& edgeLevels) -> std::optional<MeshBuffers>
 {
     const auto sub = static_cast<std::uint32_t>(1U << static_cast<unsigned>(level)); // segments per coarse quad edge
     const std::uint32_t fineDim = ((K_COARSE_DIM - 1) * sub) + 1;
@@ -231,30 +231,58 @@ auto TerrainSubdivision::buildSmoothedMesh(const QuadSnapshot& snapshot,
             out.posX = baseX + (static_cast<float>(i) * step);
             out.posY = baseY + (static_cast<float>(j) * step);
 
-            // A vertex on a pinned border line takes the straight vanilla segments instead of
-            // the spline: an unsmoothed neighbor quad renders exactly this line, whether it is
-            // a cell border or the cell's interior cross line, so the two meshes meet without
-            // a crack. Only the height changes; the bilinear attributes above already collapse
-            // to the shared edge records and match the neighbor's shading. A vertex cannot
-            // satisfy both tests at once - that would need fracX == fracY == 0, the
-            // original-vert case handled above.
+            // A vertex on one of this quad's border lines renders at that line's level (see
+            // EdgeLevels). At the build level that is the plain spline; anything lower pins
+            // the vertex onto the coarser neighbor's edge polyline so the two meshes meet
+            // without a crack - whether the line is a cell border or the cell's interior
+            // cross line. Only the height changes; the bilinear attributes above already
+            // collapse to the shared edge records and are the same linear function of
+            // position on both sides. A vertex cannot sit on two constrained lines at once -
+            // that would need fracX == fracY == 0, the original-vert case handled above.
             const int gx = gridBaseX + static_cast<int>(coarseX);
             const int gy = gridBaseY + static_cast<int>(coarseY);
-            const bool pinX = fracX == 0.0F
-                && ((((linearEdges & K_EDGE_WEST) != 0) && gx == gridBaseX)
-                    || (((linearEdges & K_EDGE_EAST) != 0)
-                        && gx == gridBaseX + static_cast<int>(K_COARSE_DIM) - 1));
-            const bool pinY = fracY == 0.0F
-                && ((((linearEdges & K_EDGE_SOUTH) != 0) && gy == gridBaseY)
-                    || (((linearEdges & K_EDGE_NORTH) != 0)
-                        && gy == gridBaseY + static_cast<int>(K_COARSE_DIM) - 1));
-            if (pinX) {
-                out.posZ = lerp(gridHeight(grid, gx, gy), gridHeight(grid, gx, gy + 1), fracY);
-            } else if (pinY) {
-                out.posZ = lerp(gridHeight(grid, gx, gy), gridHeight(grid, gx + 1, gy), fracX);
-            } else {
-                out.posZ = sampleHeight(grid, gx, gy, fracX, fracY, smoothness, maxRise);
+            int lineLevel = level;
+            bool alongY = false;
+            if (fracX == 0.0F) {
+                alongY = true;
+                if (gx == gridBaseX) {
+                    lineLevel = edgeLevels.west;
+                } else if (gx == gridBaseX + static_cast<int>(K_COARSE_DIM) - 1) {
+                    lineLevel = edgeLevels.east;
+                }
+            } else if (fracY == 0.0F) {
+                if (gy == gridBaseY) {
+                    lineLevel = edgeLevels.south;
+                } else if (gy == gridBaseY + static_cast<int>(K_COARSE_DIM) - 1) {
+                    lineLevel = edgeLevels.north;
+                }
             }
+
+            if (lineLevel >= level) {
+                out.posZ = sampleHeight(grid, gx, gy, fracX, fracY, smoothness, maxRise);
+                continue;
+            }
+
+            // Pin onto the segment between the two bracketing vertices the coarser side owns.
+            // Its vertices along the shared line are spline samples at its own step; sampling
+            // them here with the same sampleHeight collapse (one fraction always zero, so only
+            // the shared line's heights contribute) reproduces the neighbor's floats bit for
+            // bit, and everything in between lands on its straight segments. Level 0
+            // degenerates to the vanilla edge: samples at whole grid points are the original
+            // LAND heights. All positions are dyadic (k / 2^level), so the arithmetic below is
+            // exact in float and truncation is floor (along >= 0).
+            const auto lineSteps = 1U << static_cast<unsigned>(lineLevel); // verts per coarse cell on that side
+            const float along = alongY ? (static_cast<float>(gy) + fracY) : (static_cast<float>(gx) + fracX);
+            const float scaled = along * static_cast<float>(lineSteps);
+            const auto low = static_cast<std::uint32_t>(scaled);
+            const float lineFrac = scaled - static_cast<float>(low);
+            const auto lineSample = [&](std::uint32_t index) -> float {
+                const auto lineCell = static_cast<int>(index / lineSteps);
+                const float lineCellFrac = static_cast<float>(index % lineSteps) / static_cast<float>(lineSteps);
+                return alongY ? sampleHeight(grid, gx, lineCell, 0.0F, lineCellFrac, smoothness, maxRise)
+                              : sampleHeight(grid, lineCell, gy, lineCellFrac, 0.0F, smoothness, maxRise);
+            };
+            out.posZ = lerp(lineSample(low), lineSample(low + 1), lineFrac);
         }
     }
 
