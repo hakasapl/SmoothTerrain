@@ -1,6 +1,7 @@
 #include "ConfigLoader.hpp"
 #include "DecalFix.hpp"
 
+#include "TerrainFalloff.hpp"
 #include "TerrainSubdivision.hpp"
 
 #include "PCH.h"
@@ -73,7 +74,16 @@ SKSEPluginInfo(.Version = REL::Version {0,
     ConfigLoader::loadConfig();
     SKSE::AllocTrampoline(TRAMPOLINE_SIZE);
     TerrainSubdivision::install();
+    TerrainFalloff::install();
     DecalFix::install();
+
+    // The falloff's cell sink needs the game's event sources, which only exist once the data
+    // handler is up; SKSE announces that moment with kDataLoaded
+    SKSE::GetMessagingInterface()->RegisterListener([](SKSE::MessagingInterface::Message* message) -> void {
+        if (message != nullptr && message->type == SKSE::MessagingInterface::kDataLoaded) {
+            TerrainFalloff::onDataLoaded();
+        }
+    });
 
     spdlog::info("{} loaded", PLUGIN_NAME);
     return true;

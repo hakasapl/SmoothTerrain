@@ -21,10 +21,18 @@ void ConfigLoader::loadConfig()
     s_config.smoothness = std::clamp(readIniFloat(iniPath, L"fSmoothness", DEFAULT_SMOOTHNESS), 0.0F, 1.0F);
     s_config.maxRise = std::clamp(readIniFloat(iniPath, L"fMaxRise", DEFAULT_MAX_RISE), 0.0F, MAX_RISE_CAP);
 
+    // 0 (or anything below) disables the falloff outright; any other value means "the player's
+    // cell plus surroundings", which cannot be smaller than the 3x3 square (radius 2 counting
+    // the player's own grid). The upper cap is the game's own loaded-grid size, only known at
+    // runtime (see TerrainFalloff).
+    const auto rawGrids = static_cast<int>(readIniFloat(iniPath, L"iSmoothedGrids", DEFAULT_SMOOTHED_GRIDS));
+    s_config.smoothedGrids = rawGrids <= 0 ? 0 : std::max(rawGrids, MIN_SMOOTHED_GRIDS);
+
     // Log the effective values so user reports include them
     spdlog::info("Config Loaded: Subdivisions: {}", s_config.subdivisions);
     spdlog::info("Config Loaded: Smoothness: {}", s_config.smoothness);
     spdlog::info("Config Loaded: Max Rise: {}", s_config.maxRise);
+    spdlog::info("Config Loaded: Smoothed Grids: {}", s_config.smoothedGrids);
 }
 
 auto ConfigLoader::getSubdivisions() -> int { return s_config.subdivisions; }
@@ -32,6 +40,8 @@ auto ConfigLoader::getSubdivisions() -> int { return s_config.subdivisions; }
 auto ConfigLoader::getSmoothness() -> float { return s_config.smoothness; }
 
 auto ConfigLoader::getMaxRise() -> float { return s_config.maxRise; }
+
+auto ConfigLoader::getSmoothedGrids() -> int { return s_config.smoothedGrids; }
 
 auto ConfigLoader::readIniFloat(const std::filesystem::path& path,
                                 const wchar_t* key,

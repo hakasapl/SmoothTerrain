@@ -7,7 +7,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -29,6 +31,17 @@ namespace SmoothTerrain {
  * Materials, collision, multibounds and the
  * scene graph are untouched, so the change is invisible to other plugins - only the mesh
  * density changes.
+ *
+ * With the distance falloff enabled (iSmoothedGrids > 0, the default) the hook does not
+ * subdivide at build time. It registers the freshly built vanilla quad with TerrainFalloff
+ * instead, which decides per cell - based on the player's position - when to install a
+ * smoothed mesh and when to bring the vanilla one back. This class then only supplies the
+ * mesh machinery: snapshotQuad captures everything a later (possibly off-thread) build
+ * needs, buildSmoothedMesh turns a snapshot into ready GPU buffers, and setMesh /
+ * currentMesh / releaseMesh swap buffer sets on a shape without rebuilding anything.
+ * A smoothed cell that borders unsmoothed terrain emits its border-line vertices on the
+ * straight vanilla edge segments (see buildSmoothedMesh's linearEdges), so the two meshes
+ * share their edge exactly and no cracks open between them.
  *
  * Call sites are patched with the SKSE trampoline (write_call) instead of a function-entry
  * detour, so other mods (Community Shaders, ENB, ...) can still detour the builder or anything
@@ -149,6 +162,136 @@ private:
     };
     static_assert(sizeof(IndexBufferData) == K_INDEX_DATA_SIZE);
 
+public:
+    //
+    // Cell edge flags, named from the cell's point of view (west = toward the cell at x - 1).
+    // TerrainFalloff flags the edges of a smoothed cell that face unsmoothed terrain; the mesh
+    // builder then pins the vertices on those border lines to the straight vanilla edge (see
+    // buildSmoothedMesh).
+    //
+    constexpr static std::uint8_t K_EDGE_WEST = 1U << 0U;
+    constexpr static std::uint8_t K_EDGE_EAST = 1U << 1U;
+    constexpr static std::uint8_t K_EDGE_SOUTH = 1U << 2U;
+    constexpr static std::uint8_t K_EDGE_NORTH = 1U << 3U;
+
+    /**
+     * @brief One complete, installable set of land mesh buffers plus the shape fields that
+     * describe it
+     *
+     * Everything setMesh writes into a BSTriShape and everything currentMesh reads back out
+     * of one. Holding a MeshBuffers keeps nothing alive by itself - the renderer data must be
+     * released through releaseMesh (or by the shape's own destructor while installed).
+     */
+    struct MeshBuffers {
+        RE::BSGraphics::TriShape* rendererData {}; /**< The engine-allocated GPU buffer set */
+        std::uint32_t vertexCount {};
+        std::uint32_t triangleCount {};
+        RE::NiPoint3 boundCenter; /**< Model bound over these buffers' vertices */
+        float boundRadius {};
+    };
+
+    /**
+     * @brief Everything a smoothed-mesh build needs, captured from a freshly built vanilla quad
+     *
+     * Immutable once created, so it can be handed to a worker thread while the engine goes on
+     * to unload the cell or another mod touches the shape: buildSmoothedMesh reads only this.
+     * Contents are private - outside of TerrainSubdivision a snapshot is an opaque token.
+     */
+    class QuadSnapshot {
+    private:
+        friend class TerrainSubdivision;
+
+        std::array<LandVertex, K_COARSE_VERTS> coarse {}; /**< The vanilla vertex records */
+        std::array<std::array<float, K_CELL_DIM>, K_CELL_DIM> heights {}; /**< Whole-cell height grid */
+        std::uint32_t quad {}; /**< Quadrant index 0-3 */
+        std::uint64_t vertexDesc {}; /**< The shape's vertex descriptor, revalidated at capture */
+    };
+
+    /**
+     * @brief Captures a vanilla-built quad's data for a later smoothed-mesh build
+     *
+     * Runs the same validation the eager path uses (vanilla vertex/triangle counts, land
+     * vertex stride, CPU-side vertex copy present) and refuses anything that is not exactly
+     * the mesh the vanilla builder makes - another mod got there first, and leaving the shape
+     * alone is the safe outcome.
+     *
+     * Thread-safe; called from whichever thread the engine builds land on.
+     *
+     * @param shape The vanilla-built 289-vert quad shape (only read)
+     * @param data Loaded land data of the cell (the height tables)
+     * @param quad Quadrant index 0-3 (0 = SW, 1 = SE, 2 = NW, 3 = NE)
+     * @return std::shared_ptr<const QuadSnapshot> The captured data, or nullptr when the shape
+     *         is not the vanilla land layout
+     */
+    [[nodiscard]] static auto snapshotQuad(RE::BSTriShape& shape,
+                                           const RE::TESObjectLAND::LoadedLandData& data,
+                                           std::uint32_t quad) -> std::shared_ptr<const QuadSnapshot>;
+
+    /**
+     * @brief Builds ready-to-install smoothed buffers from a snapshot
+     *
+     * The mesh generation of the eager path, callable from any thread: interpolates the fine
+     * vertex grid, then creates the GPU buffers through the engine's own creators (the same
+     * ones the vanilla land builder uses off-thread, so off-main creation is proven safe).
+     * Nothing is installed anywhere - the caller owns the result and must either setMesh it
+     * or releaseMesh it.
+     *
+     * Vertices on a border line named in linearEdges are pinned to the straight segments of
+     * the vanilla cell edge (heights become a plain lerp between the two bracketing original
+     * verts) instead of following the spline. An unsmoothed neighbor renders that exact
+     * straight edge, so the two meshes meet without cracks; the crease this leaves runs along
+     * one border line only and the rest of the quad keeps its full smoothing. Both cells of a
+     * smoothed-smoothed border derive the same spline from the same shared height line, so
+     * only edges facing unsmoothed terrain should ever be flagged.
+     *
+     * @param snapshot A quad captured by snapshotQuad
+     * @param level Subdivision level 1-3
+     * @param linearEdges K_EDGE_* flags of the cell edges to pin; only the two edges this
+     *        quadrant touches (see quadEdges) have any effect
+     * @return std::optional<MeshBuffers> The new buffers, or nullopt when the renderer refused
+     *         them (out of GPU memory) or is unavailable
+     */
+    [[nodiscard]] static auto buildSmoothedMesh(const QuadSnapshot& snapshot,
+                                                int level,
+                                                std::uint8_t linearEdges) -> std::optional<MeshBuffers>;
+
+    /**
+     * @brief Reads the buffer set a shape currently renders with
+     *
+     * Main thread only (reads the live shape fields).
+     */
+    [[nodiscard]] static auto currentMesh(RE::BSTriShape& shape) -> MeshBuffers;
+
+    /**
+     * @brief Points a shape at a different buffer set
+     *
+     * Writes the renderer data pointer, the vertex/triangle counts and the model bound -
+     * nothing else, so materials, transforms and the scene graph stay untouched. Ownership of
+     * the previous buffers stays with the caller (read them out with currentMesh first).
+     *
+     * Main thread only: the render loop submits draws on the main thread, so swapping there
+     * cannot race a draw that is half way through reading the shape.
+     */
+    static void setMesh(RE::BSTriShape& shape,
+                        const MeshBuffers& mesh);
+
+    /**
+     * @brief Releases a buffer set that is not installed on any shape
+     *
+     * Same engine path BSTriShape::~BSTriShape uses; never call this for buffers a live shape
+     * still points at (the shape's destructor releases those).
+     */
+    static void releaseMesh(const MeshBuffers& mesh);
+
+    /**
+     * @brief The two cell edges a quadrant's mesh touches
+     *
+     * @param quad Quadrant index 0-3 (0 = SW, 1 = SE, 2 = NW, 3 = NE)
+     * @return std::uint8_t K_EDGE_* mask, e.g. west | south for the SW quadrant
+     */
+    [[nodiscard]] static auto quadEdges(std::uint32_t quad) -> std::uint8_t;
+
+private:
     /**
      * @brief Call-site hook around the engine's BuildQuadTriShape
      */
