@@ -373,7 +373,7 @@ private:
                            int y) -> float;
 
     /**
-     * @brief Height at a fractional cell-grid position: Catmull-Rom blended with bilinear
+     * @brief Height at a fractional cell-grid position along the Catmull-Rom spline
      *
      * Separable Catmull-Rom collapses to the exact grid value at integer positions and to
      * line-only samples on grid lines, which keeps original verts fixed and makes both quad
@@ -385,7 +385,6 @@ private:
      * @param cellY Integer grid Y of the containing coarse quad (0-32)
      * @param fracX Fractional position within the coarse quad [0, 1)
      * @param fracY Fractional position within the coarse quad [0, 1)
-     * @param smoothness 0 = bilinear only, 1 = full Catmull-Rom
      * @param maxRise World units the height may rise above the highest of the four surrounding
      *        verts; split evenly between the two interpolation passes (dips are never bounded)
      * @return float The interpolated height
@@ -397,7 +396,6 @@ private:
                              int cellY,
                              float fracX,
                              float fracY,
-                             float smoothness,
                              float maxRise) -> float;
 
     /**

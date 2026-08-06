@@ -198,7 +198,6 @@ auto TerrainSubdivision::buildSmoothedMesh(const QuadSnapshot& snapshot,
     const auto gridBaseY = static_cast<int>(quadY * (K_COARSE_DIM - 1));
     const float step = K_COARSE_STEP / static_cast<float>(sub);
 
-    const float smoothness = ConfigLoader::getSmoothness();
     const float maxRise = ConfigLoader::getMaxRise();
 
     std::vector<LandVertex> fine(fineVerts);
@@ -259,7 +258,7 @@ auto TerrainSubdivision::buildSmoothedMesh(const QuadSnapshot& snapshot,
             }
 
             if (lineLevel >= level) {
-                out.posZ = sampleHeight(grid, gx, gy, fracX, fracY, smoothness, maxRise);
+                out.posZ = sampleHeight(grid, gx, gy, fracX, fracY, maxRise);
                 continue;
             }
 
@@ -279,8 +278,8 @@ auto TerrainSubdivision::buildSmoothedMesh(const QuadSnapshot& snapshot,
             const auto lineSample = [&](std::uint32_t index) -> float {
                 const auto lineCell = static_cast<int>(index / lineSteps);
                 const float lineCellFrac = static_cast<float>(index % lineSteps) / static_cast<float>(lineSteps);
-                return alongY ? sampleHeight(grid, gx, lineCell, 0.0F, lineCellFrac, smoothness, maxRise)
-                              : sampleHeight(grid, lineCell, gy, lineCellFrac, 0.0F, smoothness, maxRise);
+                return alongY ? sampleHeight(grid, gx, lineCell, 0.0F, lineCellFrac, maxRise)
+                              : sampleHeight(grid, lineCell, gy, lineCellFrac, 0.0F, maxRise);
             };
             out.posZ = lerp(lineSample(low), lineSample(low + 1), lineFrac);
         }
@@ -500,7 +499,6 @@ auto TerrainSubdivision::sampleHeight(const std::array<std::array<float,
                                       int cellY,
                                       float fracX,
                                       float fracY,
-                                      float smoothness,
                                       float maxRise) -> float
 {
     // The two passes below each get half the allowance, so a vert that both of them lift ends
@@ -531,21 +529,7 @@ auto TerrainSubdivision::sampleHeight(const std::array<std::array<float,
     }
     // Each row already sits at most risePerPass above its own two bracketing grid samples, so
     // bounding this pass the same way puts the result within maxRise of the four verts around it
-    const float smooth
-        = fracY == 0.0F ? rows.at(1) : catmullRom(rows.at(0), rows.at(1), rows.at(2), rows.at(3), fracY, risePerPass);
-
-    if (smoothness >= 1.0F) {
-        return smooth;
-    }
-
-    // Blend toward the flat (bilinear) surface; identical to vanilla shading at 0
-    const float flat = bilerp(gridHeight(grid, cellX, cellY),
-                              gridHeight(grid, cellX + 1, cellY),
-                              gridHeight(grid, cellX, cellY + 1),
-                              gridHeight(grid, cellX + 1, cellY + 1),
-                              fracX,
-                              fracY);
-    return lerp(flat, smooth, smoothness);
+    return fracY == 0.0F ? rows.at(1) : catmullRom(rows.at(0), rows.at(1), rows.at(2), rows.at(3), fracY, risePerPass);
 }
 
 auto TerrainSubdivision::lerpVertex(const LandVertex& c00,

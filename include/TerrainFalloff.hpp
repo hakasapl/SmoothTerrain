@@ -38,9 +38,11 @@ namespace SmoothTerrain {
  * machinery, never inside a cell load.
  *
  * The stutter-free part rests on three legs:
- *  - Reverting to vanilla is free. The engine's own vanilla buffers are never released while
- *    a quad is tracked, so bringing them back is three field writes (see
- *    TerrainSubdivision::setMesh).
+ *  - Reverting to vanilla costs the main thread three field writes. The engine's own vanilla
+ *    buffers are never released while a quad is tracked, so bringing them back is a swap (see
+ *    TerrainSubdivision::setMesh), and the retired smoothed buffers are released later on the
+ *    worker (see buryMesh) - a region pass can revert an unbounded number of quads at once,
+ *    which must never become a main-thread release burst.
  *  - Smoothing is built off the main thread. Vertex interpolation and GPU buffer creation run
  *    on a worker thread against an immutable snapshot captured at build time (the engine
  *    itself builds land buffers off-thread through the same creators, which is what proves
@@ -49,13 +51,16 @@ namespace SmoothTerrain {
  *    scene-graph-mutating SKSE plugin uses, so a draw in flight can never observe a half
  *    swapped shape.
  *
- * Region updates are driven by four triggers that together cover every way the region can
+ * Region updates are driven by five triggers that together cover every way the region can
  * change: the worker's position poll (quad crossings inside a cell have no engine event, see
  * pollPlayerQuad), the player's cell-change broadcast (BGSActorCellEvent - cell attach/detach
  * traffic alone is not enough, since re-entering buffered cells reattaches their existing
  * land without rebuilding it and a sparse wilderness cell may dispatch no reference events at
- * all), the cell attach/detach stream (grid changes while the player stands still), and
- * every quad registration (async land builds finishing after the events went quiet). Each
+ * all), the cell attach/detach stream (grid changes while the player stands still), every
+ * quad registration (async land builds finishing after the events went quiet), and the
+ * deferred retry (s_retryPending - a pass that raced a shape's attach or lost a build to the
+ * renderer schedules its own follow-up through the worker rather than waiting for the next
+ * external trigger). Each
  * trigger only sets a flag; one queued main-thread pass (recompute) then walks the loaded
  * grid, decides the target state per quad, reverts instantly where smoothing must go away
  * and queues worker builds where it is missing - one pass handles entering and leaving quads
@@ -73,13 +78,17 @@ namespace SmoothTerrain {
  * Stitching: every shared border line renders at the minimum of the two adjacent quads'
  * levels - the finer side pins its extra border vertices onto the coarser side's edge
  * polyline, down to the straight vanilla segments against unsmoothed terrain (see
- * TerrainSubdivision::buildSmoothedMesh). Because a quad's level is pure coordinate math,
- * both quads of any shared line always agree on that minimum, so no cracks can open
- * anywhere: equal-level borders share the same spline, unequal ones share the coarser
- * polyline, and every corner vert is an original LAND vert that is bit-exact in all
- * variants. The gradient never puts adjacent quads more than one level apart (distance
- * changes by at most one quad between neighbors), except against unloaded cells, where the
- * pin drops straight to the vanilla line the distant LOD was authored against.
+ * TerrainSubdivision::buildSmoothedMesh). Among participating quads both sides of any
+ * shared line always agree on that minimum (the level map is pure coordinate math and both
+ * evaluate it over the same participation set), so no cracks can open between them:
+ * equal-level borders share the same spline, unequal ones share the coarser polyline, and
+ * every corner vert is an original LAND vert that is bit-exact in all variants. The
+ * gradient never puts adjacent quads more than one level apart (distance changes by at most
+ * one quad between neighbors). A neighbor that cannot participate - a foreign layout
+ * another mod rebuilt, or a cell outside the loaded grid - renders a mesh this plugin does
+ * not control; edges facing one pin to the straight vanilla line, the one edge every
+ * LAND-derived mesh agrees on (exact against anything that kept vanilla border heights, the
+ * best available guess against a mesh that did not).
  *
  * While a region shift is still in flight the two sides of an edge can briefly disagree
  * (quads apply as their builds finish, not as one atomic batch). The mismatch is bounded by
@@ -91,9 +100,10 @@ namespace SmoothTerrain {
  * driver are already saturated, and VR has no frame headroom to absorb extra work. So
  * registration copies nothing (snapshots are captured lazily when a build is first wanted),
  * the worker runs at below-normal priority, holds its batch until land builds have been
- * quiet for a beat and then paces one build every few milliseconds, and shapes retired by
- * the prune pass drop their last reference on the worker so their GPU buffers are never
- * released in a main-thread burst.
+ * quiet for a beat and then paces one build every few milliseconds, and every retirement -
+ * shapes pruned from the registry and smoothed buffer sets displaced by reverts or newer
+ * builds alike - is released on the worker so GPU buffers never go back in a main-thread
+ * burst.
  */
 class TerrainFalloff {
 public:
@@ -294,6 +304,17 @@ private:
     static void buryShapes(std::vector<RE::NiPointer<RE::BSTriShape>>&& shapes);
 
     /**
+     * @brief Hands a retired smoothed buffer set to the worker thread for release there
+     *
+     * The engine buffer-manager release is the same cost class buryShapes exists for, and one
+     * region pass can revert an unbounded number of smoothed quads at once (a whole ring on a
+     * crossing; the entire region when the player leaves the exterior). The main thread only
+     * ever swaps fields; every release it would have done lands here instead. Called with
+     * s_entryMutex held (the established s_entryMutex -> s_jobMutex order).
+     */
+    static void buryMesh(const TerrainSubdivision::MeshBuffers& mesh);
+
+    /**
      * @brief The worker: builds smoothed meshes and posts them back as main-thread tasks
      *
      * Runs detached for the lifetime of the process at below-normal priority - its work is
@@ -302,7 +323,8 @@ private:
      * last land-build registration, so batches never compete with a cell load in flight, and
      * it sleeps K_BUILD_SPACING between builds so a batch trickles instead of bursting. Skips
      * jobs whose generation is already stale before doing any work, so a sprinting player
-     * does not pile up dead builds. Also drains the graveyard (see buryShapes).
+     * does not pile up dead builds. Also drains both graveyards (see buryShapes and
+     * buryMesh).
      */
     static void workerLoop();
 
@@ -319,6 +341,8 @@ private:
     static inline std::condition_variable s_jobSignal;
     static inline std::deque<Job> s_jobs;
     static inline std::vector<RE::NiPointer<RE::BSTriShape>> s_graveyard; /**< Shapes awaiting off-main release */
+    static inline std::vector<TerrainSubdivision::MeshBuffers> s_meshGraveyard; /**< Retired smoothed buffer
+                                                                  sets awaiting off-main release (see buryMesh) */
     static inline bool s_workerStarted = false;
     static inline std::atomic<std::chrono::steady_clock::duration::rep> s_lastLandBuild {}; /**< Timestamp of the
                                                                   newest registration; the worker's quiet-period
@@ -327,6 +351,10 @@ private:
     static inline std::atomic<std::int64_t> s_lastPlayerQuad {
         std::numeric_limits<std::int64_t>::min()}; /**< The player's quad as of the last region pass or poll,
                                                       packed (x << 32 | y); the poll's change detector */
+    static inline std::atomic<bool> s_retryPending {false}; /**< A pass left unsettled work behind (a quad
+                                                      mid-attach that no event will announce, or a build the
+                                                      renderer refused); the worker's next wakeup schedules a
+                                                      follow-up pass, so nothing waits for the next crossing */
 };
 
 } // namespace SmoothTerrain

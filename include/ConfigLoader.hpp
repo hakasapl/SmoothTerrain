@@ -18,7 +18,6 @@ private:
     // DEFAULT CFG VALUES
     //
     constexpr static float DEFAULT_SUBDIVISIONS = 1.0F; /**< Default subdivision level (iSubdivisions) */
-    constexpr static float DEFAULT_SMOOTHNESS = 1.0F; /**< Default interpolation smoothness (fSmoothness) */
     constexpr static float DEFAULT_MAX_RISE = 3.0F; /**< Default upward overshoot allowance (fMaxRise) */
     constexpr static float MAX_RISE_CAP = 100000.0F; /**< Past the tallest landscape relief, so effectively no limit */
     constexpr static float DEFAULT_SMOOTHED_QUADS = 3.0F; /**< Default smoothed-quad radius (iSmoothedQuads):
@@ -44,7 +43,6 @@ private:
      */
     struct ConfigMap {
         int subdivisions {}; /**< How many times each 128-unit land quad is split in half per axis (0-3) */
-        float smoothness {}; /**< 0 = flat bilinear interpolation, 1 = full Catmull-Rom smoothing */
         float maxRise {}; /**< World units the curve may rise above the original verts around it */
         int smoothedQuads {}; /**< Radius, in landscape quads (2048 units, a quarter cell), of the full-level
                                  square, counting the player's own quad (2 = 3x3 quads); 0 = no distance
@@ -72,14 +70,6 @@ public:
      * @return int Number of times each land quad edge is halved (0 = vanilla mesh, max 3)
      */
     static auto getSubdivisions() -> int;
-
-    /**
-     * @brief Get the interpolation smoothness
-     *
-     * @return float 0 keeps interpolated verts on the vanilla (flat-shaded) surface, 1 applies full
-     *         Catmull-Rom curvature between the original verts
-     */
-    static auto getSmoothness() -> float;
 
     /**
      * @brief Get how far, in world units, the height spline may rise past the original verts

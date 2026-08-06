@@ -22,7 +22,6 @@ void ConfigLoader::loadConfig()
     // "as high as possible" value into "off".
     s_config.subdivisions = static_cast<int>(std::clamp(
         readIniFloat(iniPath, L"iSubdivisions", DEFAULT_SUBDIVISIONS), 0.0F, static_cast<float>(MAX_SUBDIVISIONS)));
-    s_config.smoothness = std::clamp(readIniFloat(iniPath, L"fSmoothness", DEFAULT_SMOOTHNESS), 0.0F, 1.0F);
     s_config.maxRise = std::clamp(readIniFloat(iniPath, L"fMaxRise", DEFAULT_MAX_RISE), 0.0F, MAX_RISE_CAP);
 
     // 0 (or anything below) lifts the distance limit (every loaded quad smooths); any other
@@ -41,15 +40,12 @@ void ConfigLoader::loadConfig()
 
     // Log the effective values so user reports include them
     spdlog::info("Config Loaded: Subdivisions: {}", s_config.subdivisions);
-    spdlog::info("Config Loaded: Smoothness: {}", s_config.smoothness);
     spdlog::info("Config Loaded: Max Rise: {}", s_config.maxRise);
     spdlog::info("Config Loaded: Smoothed Quads: {}", s_config.smoothedQuads);
     spdlog::info("Config Loaded: Gradient Step: {}", s_config.gradientStep);
 }
 
 auto ConfigLoader::getSubdivisions() -> int { return s_config.subdivisions; }
-
-auto ConfigLoader::getSmoothness() -> float { return s_config.smoothness; }
 
 auto ConfigLoader::getMaxRise() -> float { return s_config.maxRise; }
 

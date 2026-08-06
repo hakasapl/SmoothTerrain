@@ -21,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -251,6 +252,25 @@ void TerrainFalloff::recompute()
         };
         std::vector<std::pair<int, Job>> pendingBuilds;
 
+        // Sweep 1: resolve every rendered quad through the scene graph and record which
+        // lattice coordinates actually participate in the smoothing. Resolution goes through
+        // the scene graph, not LoadedLandData::geom: the engine's land geometry init rebuilds
+        // all four geom slots once per quadrant (16 builder calls per cell) but attaches only
+        // the generation current at each quadrant's turn - NiNode::SetAt(0, geom[quad]) on
+        // that quadrant's multibound node. geom therefore ends up holding the rendered shape
+        // for the last quadrant only; the attached child is the authority on what is visible
+        // (verified on 1.6.1170 at 0x2A8D51).
+        struct ResolvedQuad {
+            Entry* entry;
+            RE::TESObjectLAND::LoadedLandData* landData;
+            int quadX;
+            int quadY;
+        };
+        std::vector<ResolvedQuad> resolvedQuads;
+        std::unordered_set<std::int64_t> participating;
+        const auto packQuad = [](int quadX, int quadY) -> std::int64_t {
+            return (static_cast<std::int64_t>(quadX) << 32U) | static_cast<std::uint32_t>(quadY);
+        };
         for (std::uint32_t gridX = 0; gridX < grid->length; ++gridX) {
             for (std::uint32_t gridY = 0; gridY < grid->length; ++gridY) {
                 auto* cell = grid->GetCell(gridX, gridY);
@@ -265,17 +285,6 @@ void TerrainFalloff::recompute()
                 if (coords == nullptr) {
                     continue;
                 }
-
-                const int cellQuadBaseX = coords->cellX * 2;
-                const int cellQuadBaseY = coords->cellY * 2;
-
-                // Resolve the shapes the cell actually renders through the scene graph, not
-                // through LoadedLandData::geom. The engine's land geometry init rebuilds all
-                // four geom slots once per quadrant (16 builder calls per cell) but attaches
-                // only the generation current at each quadrant's turn - NiNode::SetAt(0,
-                // geom[quad]) on that quadrant's multibound node. geom therefore ends up
-                // holding the rendered shape for the last quadrant only; the attached child
-                // is the authority on what is visible (verified on 1.6.1170 at 0x2A8D51).
                 for (std::uint32_t quad = 0; quad < 4; ++quad) {
                     auto* node = land->loadedData->mesh[quad];
                     if (node == nullptr) {
@@ -290,62 +299,75 @@ void TerrainFalloff::recompute()
                         // cast is never acted on for foreign children
                         const auto found = s_entries.find(static_cast<RE::BSTriShape*>(child));
                         if (found == s_entries.end()) {
-                            continue; // not ours (or snapshot validation refused it at build time)
+                            continue; // not ours (validation refused it: another mod's mesh)
                         }
                         Entry& entry = found->second;
                         entry.seen = true;
-
-                        // This quad's place in the global landscape-quad lattice, its target
-                        // level, and the level of its four border lines - each the minimum
-                        // with the quad on the other side (the other half of this cell or a
-                        // neighboring cell's quad alike)
-                        const int quadX = cellQuadBaseX + static_cast<int>(entry.quad & 1U);
-                        const int quadY = cellQuadBaseY + static_cast<int>(entry.quad >> 1U);
-                        const int quadLevel = levelAt(quadX, quadY);
-                        TerrainSubdivision::EdgeLevels edgeLevels {};
-                        if (quadLevel > 0) {
-                            const auto sharedLevel = [&](int neighborX, int neighborY) -> std::uint8_t {
-                                return static_cast<std::uint8_t>(std::min(quadLevel, levelAt(neighborX, neighborY)));
-                            };
-                            edgeLevels = TerrainSubdivision::EdgeLevels {.west = sharedLevel(quadX - 1, quadY),
-                                                                        .east = sharedLevel(quadX + 1, quadY),
-                                                                        .south = sharedLevel(quadX, quadY - 1),
-                                                                        .north = sharedLevel(quadX, quadY + 1)};
-                        }
-                        if (entry.wantLevel == quadLevel
-                            && (quadLevel == 0 || edgeLevels == entry.wantEdgeLevels)) {
-                            continue; // already there, or already on its way there
-                        }
-
-                        if (quadLevel > 0 && entry.snapshot == nullptr) {
-                            // The capture deferred from registration, done here because the
-                            // cell is loaded right now: its height tables and the engine's
-                            // CPU vertex copy (alive as long as the entry is) are both at hand
-                            auto* const vanillaData = entry.vanilla.rendererData;
-                            if (vanillaData == nullptr || vanillaData->rawVertexData == nullptr) {
-                                continue; // validated at registration; defensive
-                            }
-                            entry.snapshot = TerrainSubdivision::snapshotQuad(
-                                *land->loadedData, vanillaData->rawVertexData, entry.quad, entry.vertexDesc);
-                        }
-
-                        entry.generation = s_nextGeneration.fetch_add(1, std::memory_order_relaxed);
-                        entry.wantLevel = static_cast<std::uint8_t>(quadLevel);
-                        entry.wantEdgeLevels = edgeLevels;
-                        if (quadLevel == 0) {
-                            revertEntry(entry); // instant: the vanilla buffers never went away
-                        } else {
-                            pendingBuilds.emplace_back(
-                                std::max(std::abs(quadX - playerQuadX), std::abs(quadY - playerQuadY)),
-                                Job {.key = found->first,
-                                     .keepAlive = entry.shape,
-                                     .snapshot = entry.snapshot,
-                                     .level = quadLevel,
-                                     .edgeLevels = edgeLevels,
-                                     .generation = entry.generation});
-                        }
+                        const int quadX = (coords->cellX * 2) + static_cast<int>(entry.quad & 1U);
+                        const int quadY = (coords->cellY * 2) + static_cast<int>(entry.quad >> 1U);
+                        resolvedQuads.push_back(ResolvedQuad {
+                            .entry = &entry, .landData = land->loadedData, .quadX = quadX, .quadY = quadY});
+                        participating.insert(packQuad(quadX, quadY));
                     }
                 }
+            }
+        }
+
+        // A neighbor that does not participate - foreign layout another mod rebuilt, missing
+        // land, or simply not (yet) attached - renders a mesh this plugin does not control,
+        // so the shared line pins to the straight vanilla segments, the one edge every
+        // LAND-derived mesh agrees on. A neighbor that registers later upgrades the edge on
+        // the pass its registration schedules.
+        const auto participatingLevelAt = [&](int quadX, int quadY) -> int {
+            return participating.contains(packQuad(quadX, quadY)) ? levelAt(quadX, quadY) : 0;
+        };
+
+        // Sweep 2: reconcile every resolved quad with its target level and edge levels - each
+        // border line at the minimum with the quad on the other side (the other half of this
+        // cell or a neighboring cell's quad alike)
+        for (const auto& resolved : resolvedQuads) {
+            Entry& entry = *resolved.entry;
+            const int quadLevel = levelAt(resolved.quadX, resolved.quadY);
+            TerrainSubdivision::EdgeLevels edgeLevels {};
+            if (quadLevel > 0) {
+                const auto sharedLevel = [&](int neighborX, int neighborY) -> std::uint8_t {
+                    return static_cast<std::uint8_t>(std::min(quadLevel, participatingLevelAt(neighborX, neighborY)));
+                };
+                edgeLevels = TerrainSubdivision::EdgeLevels {.west = sharedLevel(resolved.quadX - 1, resolved.quadY),
+                                                            .east = sharedLevel(resolved.quadX + 1, resolved.quadY),
+                                                            .south = sharedLevel(resolved.quadX, resolved.quadY - 1),
+                                                            .north = sharedLevel(resolved.quadX, resolved.quadY + 1)};
+            }
+            if (entry.wantLevel == quadLevel && (quadLevel == 0 || edgeLevels == entry.wantEdgeLevels)) {
+                continue; // already there, or already on its way there
+            }
+
+            if (quadLevel > 0 && entry.snapshot == nullptr) {
+                // The capture deferred from registration, done here because the cell is
+                // loaded right now: its height tables and the engine's CPU vertex copy
+                // (alive as long as the entry is) are both at hand
+                auto* const vanillaData = entry.vanilla.rendererData;
+                if (vanillaData == nullptr || vanillaData->rawVertexData == nullptr) {
+                    continue; // validated at registration; defensive
+                }
+                entry.snapshot = TerrainSubdivision::snapshotQuad(
+                    *resolved.landData, vanillaData->rawVertexData, entry.quad, entry.vertexDesc);
+            }
+
+            entry.generation = s_nextGeneration.fetch_add(1, std::memory_order_relaxed);
+            entry.wantLevel = static_cast<std::uint8_t>(quadLevel);
+            entry.wantEdgeLevels = edgeLevels;
+            if (quadLevel == 0) {
+                revertEntry(entry); // instant swap; the buffers go to the worker graveyard
+            } else {
+                pendingBuilds.emplace_back(
+                    std::max(std::abs(resolved.quadX - playerQuadX), std::abs(resolved.quadY - playerQuadY)),
+                    Job {.key = entry.shape.get(),
+                         .keepAlive = entry.shape,
+                         .snapshot = entry.snapshot,
+                         .level = quadLevel,
+                         .edgeLevels = edgeLevels,
+                         .generation = entry.generation});
             }
         }
 
@@ -398,6 +420,13 @@ void TerrainFalloff::recompute()
         // guard covers the window where a quad fresh out of the builder is only referenced by
         // us and a raw pointer on the build thread's stack (see K_PRUNE_MIN_AGE)
         if (entry.shape->GetRefCount() > 1 || (now - entry.registeredAt) < K_PRUNE_MIN_AGE) {
+            // A young, still-referenced, unseen entry is likely mid-attach: the engine files
+            // the shape into the scene graph after the build hook, with no event to announce
+            // it. Have the worker fire another pass shortly (see s_retryPending) instead of
+            // leaving the quad vanilla until the next crossing.
+            if (entry.shape->GetRefCount() > 1 && (now - entry.registeredAt) < K_PRUNE_MIN_AGE) {
+                s_retryPending.store(true, std::memory_order_relaxed);
+            }
             ++iter;
             continue;
         }
@@ -416,7 +445,7 @@ void TerrainFalloff::revertEntry(Entry& entry)
 {
     if (entry.smoothed.has_value()) {
         TerrainSubdivision::setMesh(*entry.shape, entry.vanilla);
-        TerrainSubdivision::releaseMesh(*entry.smoothed);
+        buryMesh(*entry.smoothed); // released on the worker; a pass can revert dozens at once
         entry.smoothed.reset();
     }
     entry.appliedLevel = 0;
@@ -433,25 +462,29 @@ void TerrainFalloff::applyBuiltMesh(const Job& job,
     if (found == s_entries.end() || found->second.generation != job.generation) {
         // The world moved on while this mesh was building
         if (mesh.has_value()) {
-            TerrainSubdivision::releaseMesh(*mesh);
+            buryMesh(*mesh);
         }
         return;
     }
 
     Entry& entry = found->second;
     if (!mesh.has_value()) {
-        // The renderer refused the buffers (likely GPU memory); resetting the target to the
-        // current state lets the next region change retry instead of wedging the quad
+        // The renderer refused the buffers (likely GPU memory); reset the target to the
+        // current state and let the worker's next wakeup schedule a retry pass - waiting for
+        // the next region change instead could leave a mismatched edge in place indefinitely
+        // while the player stands still. The poll cadence is the retry backoff.
         spdlog::warn("Smoothed land mesh build failed; quad {} keeps its current mesh for now", entry.quad);
         entry.wantLevel = entry.appliedLevel;
         entry.wantEdgeLevels = entry.appliedEdgeLevels;
+        s_retryPending.store(true, std::memory_order_relaxed);
         return;
     }
 
-    // The swap itself: a few field writes on the main thread, no allocation, no upload
+    // The swap itself: a few field writes on the main thread, no allocation, no upload, no
+    // release (the replaced set goes to the worker)
     TerrainSubdivision::setMesh(*entry.shape, *mesh);
     if (entry.smoothed.has_value()) {
-        TerrainSubdivision::releaseMesh(*entry.smoothed); // an older variant or level
+        buryMesh(*entry.smoothed); // an older variant or level
     }
     entry.smoothed = *mesh;
     entry.appliedLevel = static_cast<std::uint8_t>(job.level);
@@ -488,6 +521,14 @@ void TerrainFalloff::buryShapes(std::vector<RE::NiPointer<RE::BSTriShape>>&& sha
     s_jobSignal.notify_one();
 }
 
+void TerrainFalloff::buryMesh(const TerrainSubdivision::MeshBuffers& mesh)
+{
+    const std::lock_guard<std::mutex> lock(s_jobMutex);
+    ensureWorkerLocked();
+    s_meshGraveyard.push_back(mesh);
+    s_jobSignal.notify_one();
+}
+
 void TerrainFalloff::pollPlayerQuad()
 {
     auto* player = RE::PlayerCharacter::GetSingleton();
@@ -513,13 +554,15 @@ void TerrainFalloff::workerLoop()
         Job job;
         bool haveJob = false;
         std::vector<RE::NiPointer<RE::BSTriShape>> retired;
+        std::vector<TerrainSubdivision::MeshBuffers> retiredMeshes;
         {
             std::unique_lock<std::mutex> lock(s_jobMutex);
             // Timed wait: the wakeups double as the player-position poll below
             s_jobSignal.wait_for(lock, K_PLAYER_POLL_INTERVAL, []() -> bool {
-                return !s_jobs.empty() || !s_graveyard.empty();
+                return !s_jobs.empty() || !s_graveyard.empty() || !s_meshGraveyard.empty();
             });
             retired.swap(s_graveyard);
+            retiredMeshes.swap(s_meshGraveyard);
             if (!s_jobs.empty()) {
                 job = std::move(s_jobs.front());
                 s_jobs.pop_front();
@@ -527,14 +570,23 @@ void TerrainFalloff::workerLoop()
             }
         }
 
-        // Dropping these references here is the point: each destruction releases GPU buffers
-        // through the engine, off the main thread (the engine destroys shapes on its own
-        // loader threads the same way)
+        // Releasing here is the point: each shape destruction and each retired buffer set
+        // goes through the engine's buffer manager, off the main thread (the engine destroys
+        // shapes on its own loader threads the same way)
         retired.clear();
+        for (const auto& mesh : retiredMeshes) {
+            TerrainSubdivision::releaseMesh(mesh);
+        }
 
         // Quad crossings inside a cell have no engine event; this poll is what moves the
         // region between cell borders
         pollPlayerQuad();
+
+        // A pass that could not settle everything (a quad mid-attach with no event coming, a
+        // build the renderer refused) leaves a note; fire the follow-up pass at poll cadence
+        if (s_retryPending.exchange(false, std::memory_order_relaxed)) {
+            scheduleRecompute();
+        }
 
         if (!haveJob) {
             continue;
@@ -574,12 +626,13 @@ void TerrainFalloff::workerLoop()
                 TerrainSubdivision::releaseMesh(*mesh);
             }
             // Reset the target like applyBuiltMesh's failure path would have, so a later
-            // region change retries instead of believing this level is on its way
+            // pass retries instead of believing this level is on its way
             const std::lock_guard<std::mutex> lock(s_entryMutex);
             const auto found = s_entries.find(job.key);
             if (found != s_entries.end() && found->second.generation == job.generation) {
                 found->second.wantLevel = found->second.appliedLevel;
                 found->second.wantEdgeLevels = found->second.appliedEdgeLevels;
+                s_retryPending.store(true, std::memory_order_relaxed);
             }
             continue;
         }
