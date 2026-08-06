@@ -317,8 +317,8 @@ auto TerrainSubdivision::buildSmoothedMesh(const QuadSnapshot& snapshot,
         return std::nullopt;
     }
     static const REL::Relocation<Offsets::CreateTriShapeData_t> createTriShapeData {Offsets::K_CREATE_TRISHAPE_DATA};
-    auto* const newData = createTriShapeData(
-        renderer, fine.data(), fineVerts * sizeof(LandVertex), snapshot.vertexDesc, indexBuffer);
+    auto* const newData
+        = createTriShapeData(renderer, fine.data(), fineVerts * sizeof(LandVertex), snapshot.vertexDesc, indexBuffer);
     if (newData == nullptr) {
         return std::nullopt;
     }

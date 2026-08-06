@@ -69,9 +69,7 @@ void DecalFix::install()
         return;
     }
 
-    spdlog::info("Decal fix installed: {} collector call sites, {} index list call sites",
-                 patched,
-                 getterSites.size());
+    spdlog::info("Decal fix installed: {} collector call sites, {} index list call sites", patched, getterSites.size());
 }
 
 auto DecalFix::CollectHook::thunk(RE::BSTempEffectSimpleDecal* decal,

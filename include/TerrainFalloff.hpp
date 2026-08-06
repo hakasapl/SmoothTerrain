@@ -230,8 +230,7 @@ private:
      */
     struct PlayerCellSink final : RE::BSTEventSink<RE::BGSActorCellEvent> {
         auto ProcessEvent(const RE::BGSActorCellEvent* event,
-                          RE::BSTEventSource<RE::BGSActorCellEvent>* source)
-            -> RE::BSEventNotifyControl override;
+                          RE::BSTEventSource<RE::BGSActorCellEvent>* source) -> RE::BSEventNotifyControl override;
     };
 
     /**

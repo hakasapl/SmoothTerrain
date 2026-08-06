@@ -169,7 +169,8 @@ private:
 public:
     constexpr static float K_QUAD_WORLD_SIZE = 2048.0F; /**< World units per landscape quad side; the falloff's
                                                            distance unit (a cell is 2x2 quads) */
-    static_assert(K_QUAD_WORLD_SIZE == K_QUAD_SIZE, "the public quad size must match the mesh constants");
+    static_assert(K_QUAD_WORLD_SIZE == K_QUAD_SIZE,
+                  "the public quad size must match the mesh constants");
 
     /**
      * @brief Target mesh level of a quad's four border lines, named from the quad's point of

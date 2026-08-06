@@ -32,7 +32,6 @@ public:
                                                     at the player's feet. */
 
 private:
-
 public:
     constexpr static int MAX_SUBDIVISIONS = 3; /**< Hard cap: level 4 would overflow BSTriShape's 16-bit vertex count
                                                   (129x129 = 16641 verts at level 3 is the last that fits) */

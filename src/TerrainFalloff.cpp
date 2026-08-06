@@ -206,8 +206,7 @@ void TerrainFalloff::recompute()
     if (center != nullptr && grid != nullptr && grid->cells != nullptr) {
         // The loaded grid bounds everything: a quad whose cell is not loaded has no mesh to
         // smooth. The grid array's length is the live uGridsToLoad, whatever set it.
-        const int loadedRadius
-            = grid->length > 0 ? (static_cast<int>(grid->length) - 1) / 2 : K_DEFAULT_LOADED_RADIUS;
+        const int loadedRadius = grid->length > 0 ? (static_cast<int>(grid->length) - 1) / 2 : K_DEFAULT_LOADED_RADIUS;
 
         // The region lives in landscape-quad coordinates (a cell is 2x2 quads), centered on
         // the quad under the player's feet, so the boundary sits at half-cell resolution and
@@ -216,17 +215,14 @@ void TerrainFalloff::recompute()
         // coordinate math, so both quads of any shared border line always agree on whether
         // that line is pinned - within one cell and across cells alike.
         const auto playerPosition = player->GetPosition();
-        const auto playerQuadX
-            = static_cast<int>(std::floor(playerPosition.x / TerrainSubdivision::K_QUAD_WORLD_SIZE));
-        const auto playerQuadY
-            = static_cast<int>(std::floor(playerPosition.y / TerrainSubdivision::K_QUAD_WORLD_SIZE));
+        const auto playerQuadX = static_cast<int>(std::floor(playerPosition.x / TerrainSubdivision::K_QUAD_WORLD_SIZE));
+        const auto playerQuadY = static_cast<int>(std::floor(playerPosition.y / TerrainSubdivision::K_QUAD_WORLD_SIZE));
         s_lastPlayerQuad.store((static_cast<std::int64_t>(playerQuadX) << 32U)
                                    | static_cast<std::uint32_t>(playerQuadY),
                                std::memory_order_relaxed);
 
         const int configuredQuads = ConfigLoader::getSmoothedQuads();
-        const int quadRadius
-            = configuredQuads <= 0 ? std::numeric_limits<int>::max() : configuredQuads - 1;
+        const int quadRadius = configuredQuads <= 0 ? std::numeric_limits<int>::max() : configuredQuads - 1;
         const int gradientStep = ConfigLoader::getGradientStep();
         const int maxLevel = ConfigLoader::getSubdivisions();
         const auto levelAt = [&](int quadX, int quadY) -> int {
@@ -334,9 +330,9 @@ void TerrainFalloff::recompute()
                     return static_cast<std::uint8_t>(std::min(quadLevel, participatingLevelAt(neighborX, neighborY)));
                 };
                 edgeLevels = TerrainSubdivision::EdgeLevels {.west = sharedLevel(resolved.quadX - 1, resolved.quadY),
-                                                            .east = sharedLevel(resolved.quadX + 1, resolved.quadY),
-                                                            .south = sharedLevel(resolved.quadX, resolved.quadY - 1),
-                                                            .north = sharedLevel(resolved.quadX, resolved.quadY + 1)};
+                                                             .east = sharedLevel(resolved.quadX + 1, resolved.quadY),
+                                                             .south = sharedLevel(resolved.quadX, resolved.quadY - 1),
+                                                             .north = sharedLevel(resolved.quadX, resolved.quadY + 1)};
             }
             if (entry.wantLevel == quadLevel && (quadLevel == 0 || edgeLevels == entry.wantEdgeLevels)) {
                 continue; // already there, or already on its way there
@@ -374,9 +370,9 @@ void TerrainFalloff::recompute()
         // Nearest terrain first: after a load or a teleport the whole region builds at once,
         // and the ground the player is actually looking at should stop being vanilla first
         if (!pendingBuilds.empty()) {
-            std::sort(pendingBuilds.begin(),
-                      pendingBuilds.end(),
-                      [](const auto& jobA, const auto& jobB) -> bool { return jobA.first < jobB.first; });
+            std::sort(pendingBuilds.begin(), pendingBuilds.end(), [](const auto& jobA, const auto& jobB) -> bool {
+                return jobA.first < jobB.first;
+            });
             std::vector<Job> jobs;
             jobs.reserve(pendingBuilds.size());
             for (auto& [distance, job] : pendingBuilds) {
@@ -596,8 +592,7 @@ void TerrainFalloff::workerLoop()
         // means a cell load is in flight and every core is spoken for. Reverts are not gated
         // by this - they are instant main-thread field writes.
         for (;;) {
-            const auto lastBuild
-                = std::chrono::steady_clock::duration(s_lastLandBuild.load(std::memory_order_relaxed));
+            const auto lastBuild = std::chrono::steady_clock::duration(s_lastLandBuild.load(std::memory_order_relaxed));
             const auto sinceLastBuild = std::chrono::steady_clock::now().time_since_epoch() - lastBuild;
             if (sinceLastBuild >= K_BUILD_QUIET_PERIOD) {
                 break;
