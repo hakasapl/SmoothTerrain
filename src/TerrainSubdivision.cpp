@@ -357,16 +357,64 @@ void TerrainSubdivision::setMesh(RE::BSTriShape& shape,
 
 void TerrainSubdivision::releaseMesh(const MeshBuffers& mesh) { releaseRendererData(mesh.rendererData); }
 
+auto TerrainSubdivision::fineQuadDim(int level) -> std::uint32_t
+{
+    return ((K_COARSE_DIM - 1) << static_cast<unsigned>(level)) + 1;
+}
+
+auto TerrainSubdivision::buildQuadHeightField(const CellHeightGrid& grid,
+                                              std::uint32_t quad,
+                                              int level) -> QuadHeightField
+{
+    const auto sub = static_cast<std::uint32_t>(1U << static_cast<unsigned>(level));
+    const std::uint32_t dim = fineQuadDim(level);
+
+    // Where this quadrant sits in the cell grid (0 = SW, 1 = SE, 2 = NW, 3 = NE)
+    const auto gridBaseX = static_cast<int>((quad & 1U) * (K_COARSE_DIM - 1));
+    const auto gridBaseY = static_cast<int>((quad >> 1U) * (K_COARSE_DIM - 1));
+    const float maxRise = ConfigLoader::getMaxRise();
+
+    QuadHeightField field;
+    field.dim = dim;
+    field.heights.resize(static_cast<std::size_t>(dim) * dim);
+    field.minHeight = std::numeric_limits<float>::max();
+    field.maxHeight = std::numeric_limits<float>::lowest();
+
+    // Row major, row growing north: the engine's own layout for heights[quad], generalized to
+    // the finer step. At level 0 every sample lands on a whole grid point and sampleHeight
+    // returns the stored height untouched, so the grid is the vanilla one bit for bit.
+    for (std::uint32_t row = 0; row < dim; ++row) {
+        const int coarseY = gridBaseY + static_cast<int>(row / sub);
+        const float fracY = static_cast<float>(row % sub) / static_cast<float>(sub);
+        for (std::uint32_t col = 0; col < dim; ++col) {
+            const int coarseX = gridBaseX + static_cast<int>(col / sub);
+            const float fracX = static_cast<float>(col % sub) / static_cast<float>(sub);
+            const float height = sampleHeight(grid, coarseX, coarseY, fracX, fracY, maxRise);
+            field.heights.at((static_cast<std::size_t>(row) * dim) + col) = height;
+            field.minHeight = std::min(field.minHeight, height);
+            field.maxHeight = std::max(field.maxHeight, height);
+        }
+    }
+    return field;
+}
+
 void TerrainSubdivision::buildCellHeightGrid(const RE::TESObjectLAND::LoadedLandData& data,
                                              std::array<std::array<float,
                                                                    K_CELL_DIM>,
                                                         K_CELL_DIM>& grid)
 {
-    // Bounds-checked copy of the engine's float[4][289] height table
-    std::array<std::array<float, K_COARSE_VERTS>, K_QUAD_COUNT> quadHeights {};
-    static_assert(sizeof(quadHeights) == sizeof(RE::TESObjectLAND::LoadedLandData::heights),
+    static_assert(sizeof(RE::TESObjectLAND::LoadedLandData::heights)
+                      == sizeof(float) * K_QUAD_COUNT * K_COARSE_VERTS,
                   "the height table layout must match the engine's");
-    std::memcpy(quadHeights.data(), &data.heights, sizeof(quadHeights));
+    buildCellHeightGrid(&data.heights[0][0], grid);
+}
+
+void TerrainSubdivision::buildCellHeightGrid(const float* quadHeights,
+                                             CellHeightGrid& grid)
+{
+    // Bounds-checked copy of the engine's float[4][289] height table
+    std::array<std::array<float, K_COARSE_VERTS>, K_QUAD_COUNT> table {};
+    std::memcpy(table.data(), quadHeights, sizeof(table));
 
     // Quadrants overlap on their shared rows/columns with identical values (they were split
     // from the one 33x33 LAND grid at load), so overwrite order does not matter
@@ -375,7 +423,7 @@ void TerrainSubdivision::buildCellHeightGrid(const RE::TESObjectLAND::LoadedLand
         const std::uint32_t offsetY = (quad >> 1U) * (K_COARSE_DIM - 1);
         for (std::uint32_t row = 0; row < K_COARSE_DIM; ++row) {
             for (std::uint32_t col = 0; col < K_COARSE_DIM; ++col) {
-                grid.at(offsetY + row).at(offsetX + col) = quadHeights.at(quad).at((row * K_COARSE_DIM) + col);
+                grid.at(offsetY + row).at(offsetX + col) = table.at(quad).at((row * K_COARSE_DIM) + col);
             }
         }
     }

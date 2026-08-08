@@ -1,6 +1,7 @@
 #include "ConfigLoader.hpp"
 #include "DecalFix.hpp"
 
+#include "TerrainCollision.hpp"
 #include "TerrainFalloff.hpp"
 #include "TerrainSubdivision.hpp"
 
@@ -22,8 +23,9 @@ using namespace std::literals;
 
 namespace {
 
-constexpr std::size_t TRAMPOLINE_SIZE = 128; /**< Each patched call site needs 14 bytes; at most five sites today
-                                                  (two builder plus three decal on AE, one builder site fewer on SE) */
+constexpr std::size_t TRAMPOLINE_SIZE = 192; /**< Each patched call site needs 14 bytes; at most seven sites today
+                                                  (two builder plus three decal plus two collision on AE, one
+                                                  builder site fewer on SE) */
 
 /**
  * @brief Sets up the global log file for the plugin using spdlog
@@ -75,6 +77,7 @@ SKSEPluginInfo(.Version = REL::Version {0,
     SKSE::AllocTrampoline(TRAMPOLINE_SIZE);
     TerrainSubdivision::install();
     TerrainFalloff::install();
+    TerrainCollision::install();
     DecalFix::install();
 
     // The falloff's cell sink needs the game's event sources, which only exist once the data

@@ -33,6 +33,7 @@ set(headers
     "include/HookUtil.hpp"
     "include/Offsets.hpp"
     "include/PCH.h"
+    "include/TerrainCollision.hpp"
     "include/TerrainFalloff.hpp"
     "include/TerrainSubdivision.hpp"
 )
@@ -42,6 +43,7 @@ set(sources
     "src/DecalFix.cpp"
     "src/HookUtil.cpp"
     "src/main.cpp"
+    "src/TerrainCollision.cpp"
     "src/TerrainFalloff.cpp"
     "src/TerrainSubdivision.cpp"
 )

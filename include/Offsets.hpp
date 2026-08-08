@@ -48,6 +48,33 @@ constexpr REL::RelocationID K_BUILD_LAND_QUADS(18369,
                                                18792);
 
 /**
+ * @brief bool CellMopp::BuildLandCollision(CellMopp* mopp, const LandCollisionDesc* desc)
+ *
+ * Builds a cell's landscape collision: one bhkTriSampledHeightFieldBvTreeShape per quadrant over
+ * the LAND height grid, each wrapped in a bhkRigidBody queued into the cell's havok world. Called
+ * once per land load, from the tail of K_BUILD_LAND_GEOMETRY - its only call site in the whole
+ * executable on all three flavors, so the scan for it can overshoot freely.
+ * 1.5.97: 0x39B080. 1.6.1170: 0x3F3570. VR 1.4.15: 0x3AA900.
+ */
+constexpr REL::RelocationID K_BUILD_LAND_COLLISION(25262,
+                                                   25784);
+
+/**
+ * @brief bhkTriSampledHeightFieldBvTreeShape::InitFromCInfo(bhkShape* shape, HeightFieldCInfo* cinfo)
+ *
+ * Turns one quadrant's height grid into the havok shape the rigid body collides against: it fills
+ * a stack hkBSHeightFieldShape from the cinfo, samples that into a heap
+ * hkpCompressedSampledHeightFieldShape (quantized copy - the engine keeps no pointer into the
+ * cinfo's height array), wraps it in a hkpTriSampledHeightFieldCollection plus its BV tree and
+ * hands the result to the bhk wrapper. Called only by K_BUILD_LAND_COLLISION, once per quadrant,
+ * and that is the function's only call site in the whole executable (it is also vfunc 46 of the
+ * shape, which nothing reaches).
+ * 1.5.97: 0xDEC000. 1.6.1170: 0xECDAB0. VR 1.4.15: 0xE40FD0.
+ */
+constexpr REL::RelocationID K_INIT_HEIGHT_FIELD_SHAPE(77186,
+                                                      79074);
+
+/**
  * @brief BSGraphics::TriShape* CreateTriShapeRendererData(Renderer*, const void* vertexData,
  *          uint32_t sizeBytes, uint64_t vertexDesc, IndexBufferData* sharedIndexBuffer)
  *

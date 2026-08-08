@@ -34,9 +34,10 @@ namespace SmoothTerrain {
  * limited against upward overshoot (see limitedTangent), which holds every new vertex within
  * a fixed number of world units of the highest original vert around it and so keeps the
  * subdivided mesh out of static meshes the vanilla surface passed under; dips are left
- * unbounded. Every other attribute is bilinear. Materials, collision, multibounds and the
- * scene graph are untouched, so the change is invisible to other plugins - only the mesh
- * density changes.
+ * unbounded. Every other attribute is bilinear. Materials, multibounds and the scene graph are
+ * untouched, so the change is invisible to other plugins - only the mesh density changes. What
+ * the player walks on is a separate engine structure (a sampled height field, not this mesh);
+ * TerrainCollision rebuilds it from the same spline, through buildQuadHeightField below.
  *
  * This class supplies the mesh machinery: snapshotQuad captures everything a later
  * (off-thread) build needs, buildSmoothedMesh turns a snapshot into ready GPU buffers, and
@@ -171,6 +172,76 @@ public:
                                                            distance unit (a cell is 2x2 quads) */
     static_assert(K_QUAD_WORLD_SIZE == K_QUAD_SIZE,
                   "the public quad size must match the mesh constants");
+
+    constexpr static std::uint32_t K_QUADS_PER_CELL = 4; /**< Landscape quadrants per cell (0 = SW, 1 = SE,
+                                                            2 = NW, 3 = NE) */
+    static_assert(K_QUADS_PER_CELL == K_QUAD_COUNT,
+                  "the public quadrant count must match the mesh constants");
+
+    constexpr static std::uint32_t K_VANILLA_QUAD_DIM = 17; /**< Verts per side of a vanilla quadrant grid, and so
+                                                               the dimension of LoadedLandData::heights[quad] */
+    static_assert(K_VANILLA_QUAD_DIM == K_COARSE_DIM,
+                  "the public vanilla grid dimension must match the mesh constants");
+
+    /**
+     * @brief The whole cell's land heights, indexed [y][x] with x/y growing east/north
+     *
+     * Assembled from the four overlapping quadrant grids so that everything derived from it -
+     * mesh heights and collision heights alike - is continuous across the cell's interior quad
+     * borders by construction (see buildCellHeightGrid).
+     */
+    using CellHeightGrid = std::array<std::array<float, K_CELL_DIM>, K_CELL_DIM>;
+
+    /**
+     * @brief One quadrant's smoothed heights on a subdivided grid
+     *
+     * Laid out exactly like the engine's LoadedLandData::heights[quad] it stands in for: row
+     * major, row growing north and column growing east, heights relative to the same per-land
+     * base. Only the dimension changes, so anything that reads the vanilla table with its own
+     * dimension reads this one unchanged (see TerrainCollision).
+     */
+    struct QuadHeightField {
+        std::vector<float> heights; /**< dim * dim samples, row major */
+        std::uint32_t dim {}; /**< Verts per side */
+        float minHeight {}; /**< Lowest sample, for the shape's bounds */
+        float maxHeight {}; /**< Highest sample */
+    };
+
+    /**
+     * @brief Verts per side of a quadrant grid at a subdivision level
+     *
+     * @param level Subdivision level (0 = the vanilla 17)
+     * @return std::uint32_t Grid dimension
+     */
+    [[nodiscard]] static auto fineQuadDim(int level) -> std::uint32_t;
+
+    /**
+     * @brief Assembles the whole-cell height grid from the engine's raw quadrant height table
+     *
+     * @param quadHeights The engine's float[4][289] table (i.e. &LoadedLandData::heights[0][0])
+     * @param grid Output grid
+     */
+    static void buildCellHeightGrid(const float* quadHeights,
+                                    CellHeightGrid& grid);
+
+    /**
+     * @brief Samples one quadrant's smoothed surface onto a subdivided height grid
+     *
+     * The same Catmull-Rom surface buildSmoothedMesh draws, evaluated on a plain grid instead of
+     * into vertex records - the collision counterpart of the render mesh. No edge pinning: a
+     * height field is built at one level for every quad of every loaded cell, so both sides of
+     * any shared border line sample the very same spline over the very same shared heights (a
+     * cell border collapses to that border column, an interior quad border is inside the one
+     * cell grid) and the surfaces meet exactly.
+     *
+     * @param grid The cell's height grid
+     * @param quad Quadrant index 0-3
+     * @param level Subdivision level (0 reproduces the vanilla heights bit-exactly)
+     * @return QuadHeightField The sampled grid and its height range
+     */
+    [[nodiscard]] static auto buildQuadHeightField(const CellHeightGrid& grid,
+                                                   std::uint32_t quad,
+                                                   int level) -> QuadHeightField;
 
     /**
      * @brief Target mesh level of a quad's four border lines, named from the quad's point of
