@@ -53,16 +53,41 @@ void setupLog()
 // CommonLibSSE-NG / SKSE Exports
 //
 
-SKSEPluginInfo(.Version = REL::Version {0,
-                                        1,
-                                        0,
-                                        0},
-               .Name = "SmoothTerrain",
-               .Author = "hakasapl",
-               .StructCompatibility = SKSE::StructCompatibility::Independent,
-               .RuntimeCompatibility = SKSE::VersionIndependence::AddressLibrary)
+// SKSE on 1.7.99+ refuses to version-independent-load an Address Library plugin unless its
+// version data carries kVersionIndependentEx_AddressLibraryV5, the "I can read the format 5
+// database" declaration ("must be recompiled for new address library" otherwise). The
+// SKSEPluginInfo macro cannot express that bit - its PluginDeclaration layout feeds
+// StructCompatibility into the versionIndependenceEx dword - so the version data is declared
+// directly; PluginVersionData defaults the flag in. Older SKSE builds apply no known-bit mask
+// to versionIndependenceEx, so the extra bit is inert on 1.6.x, and SE / VR SKSE load through
+// SKSEPlugin_Query below without reading this struct at all.
+SKSE_PLUGIN_VERSION = []() {
+    SKSE::PluginVersionData data {};
+    data.PluginVersion(REL::Version {0,
+                                     1,
+                                     0,
+                                     0});
+    data.PluginName("SmoothTerrain");
+    data.AuthorName("hakasapl");
+    data.UsesAddressLibrary();
+    data.UsesNoStructs();
+    // Explicit rather than inherited from PluginVersionData's default member initializer, so
+    // a future CommonLib change to that default cannot silently drop the declaration
+    data.versionIndependenceEx |= SKSE::PluginVersionData::kVersionIndependentEx_AddressLibraryV5;
+    return data;
+}();
 
-    SKSEPluginLoad(const SKSE::LoadInterface* skse)
+// SE (1.5.x) and VR SKSE load plugins through the query/load pair instead of the version data
+SKSE_EXPORT auto SKSEPlugin_Query(SKSE::QueryInterface* /*skse*/,
+                                  SKSE::PluginInfo* pluginInfo) -> bool
+{
+    pluginInfo->infoVersion = SKSE::PluginInfo::kVersion;
+    pluginInfo->name = SKSEPlugin_Version.GetPluginName().data();
+    pluginInfo->version = static_cast<std::uint32_t>(SKSEPlugin_Version.GetPluginVersion().pack());
+    return true;
+}
+
+SKSEPluginLoad(const SKSE::LoadInterface* skse)
 {
     SKSE::Init(skse);
     setupLog();

@@ -255,7 +255,7 @@ void TerrainFalloff::recompute()
         // the generation current at each quadrant's turn - NiNode::SetAt(0, geom[quad]) on
         // that quadrant's multibound node. geom therefore ends up holding the rendered shape
         // for the last quadrant only; the attached child is the authority on what is visible
-        // (verified on 1.6.1170 at 0x2A8D51).
+        // (verified on 1.6.1170 at 0x2A8D51 and 1.7.99 at 0x2AE8A1).
         struct ResolvedQuad {
             Entry* entry;
             RE::TESObjectLAND::LoadedLandData* landData;
