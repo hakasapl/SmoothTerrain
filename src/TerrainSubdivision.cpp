@@ -320,6 +320,14 @@ auto TerrainSubdivision::buildSmoothedMesh(const QuadSnapshot& snapshot,
     if (newData == nullptr) {
         return std::nullopt;
     }
+    // The engine ignores CreateBuffer's HRESULT, so a refused upload (out of GPU memory,
+    // device lost) comes back as a set with a null vertex buffer. The engine's release skips
+    // null buffers on every runtime, so the half-built set is safely handed back
+    if (newData->vertexBuffer == nullptr) {
+        spdlog::error("Failed to create a level {} land vertex buffer ({} vertices)", level, fineVerts);
+        releaseRendererData(newData);
+        return std::nullopt;
+    }
 
     return MeshBuffers {.rendererData = newData,
                         .vertexCount = fineVerts,
@@ -653,13 +661,19 @@ auto TerrainSubdivision::getIndexBuffer(int level) -> IndexBufferData*
     }
 
     static const REL::Relocation<Offsets::CreateIndexBuffer_t> createIndexBuffer {Offsets::K_CREATE_INDEX_BUFFER};
-    slot = static_cast<IndexBufferData*>(
+    auto* const created = static_cast<IndexBufferData*>(
         createIndexBuffer(renderer, static_cast<std::uint32_t>(indices.size()), indices.data()));
-    if (slot == nullptr) {
+    // The engine ignores CreateBuffer's HRESULT: a refused upload (out of GPU memory, device
+    // lost) still returns a wrapper, just with a null buffer. CreateTriShapeData AddRefs that
+    // buffer unchecked, so caching it would crash every later build. Not cached, so a later
+    // call retries; the 16-byte wrapper is leaked since the engine's release would
+    // dereference the null buffer
+    if (created == nullptr || created->buffer == nullptr) {
         spdlog::error("Failed to create the level {} land index buffer ({} indices)", level, indices.size());
-    } else {
-        spdlog::info("Created shared level {} land index buffer ({} indices)", level, indices.size());
+        return nullptr;
     }
+    slot = created;
+    spdlog::info("Created shared level {} land index buffer ({} indices)", level, indices.size());
     return slot;
 }
 

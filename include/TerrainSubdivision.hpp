@@ -495,7 +495,8 @@ private:
      * The CPU copy the buffer was built from is kept in s_indexData.
      *
      * @param level Subdivision level 1-3
-     * @return IndexBufferData* The shared wrapper, or nullptr when creation failed
+     * @return IndexBufferData* The shared wrapper, or nullptr when creation failed (failures
+     *         are not cached, so a later call retries)
      */
     static auto getIndexBuffer(int level) -> IndexBufferData*;
 
